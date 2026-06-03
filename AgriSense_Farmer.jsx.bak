@@ -1,0 +1,2123 @@
+import { useState, useRef, useEffect } from "react";
+
+/* ══════════════════════════════════════
+   API KEYS
+══════════════════════════════════════ */
+const KEYS = {
+  weather:  "fc79a8fec536a8d270a4ab964d9be6de",
+  plantnet: "2b103Mc1qrm20DjFBlqkYnjxiO",
+  gemini:   "AIzaSyD8Xie5or7qIawmZCmgflAuAj0JkPZZyHk",
+  groq:     "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",
+};
+
+/* ── Gemini — used for structured JSON (soil, crops, market, plant scan) ── */
+async function gemini(prompt, imgB64 = null) {
+  const parts = imgB64
+    ? [{ inline_data: { mime_type: "image/jpeg", data: imgB64 } }, { text: prompt }]
+    : [{ text: prompt }];
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${KEYS.gemini}`,
+      { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ contents:[{ parts }] }) }
+    );
+    const d = await r.json();
+    return (d?.candidates?.[0]?.content?.parts?.[0]?.text||"").replace(/```json|```/g,"").trim();
+  } catch { return ""; }
+}
+
+/* ── Groq — routed via Anthropic API proxy to bypass CORS ── */
+async function groqChat(messages) {
+  // Groq direct calls are blocked by CORS in browser sandboxes.
+  // We use the Anthropic /v1/messages proxy which IS accessible from artifacts.
+  try {
+    const systemMsg = messages.find(m => m.role === "system");
+    const convoMsgs = messages.filter(m => m.role !== "system");
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 200,
+        system: systemMsg?.content || "You are a helpful farming assistant.",
+        messages: convoMsgs.map(m => ({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: m.content,
+        })),
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      console.error("Chat API error:", r.status, err);
+      return "";
+    }
+    const d = await r.json();
+    return d?.content?.[0]?.text?.trim() || "";
+  } catch (e) {
+    console.error("Chat fetch error:", e);
+    return "";
+  }
+}
+
+const pj = (s, fb) => { try { return JSON.parse(s); } catch { return fb; } };
+
+/* ══════════════════════════════════════
+   CROP DATABASE
+══════════════════════════════════════ */
+const CROPS = {
+  "தானியங்கள் | Cereals": [
+    {n:"நெல் | Paddy",e:"🌾",s:"Jun–Oct",r:"All India"},
+    {n:"கோதுமை | Wheat",e:"🌾",s:"Nov–Mar",r:"North India"},
+    {n:"மக்காச்சோளம் | Maize",e:"🌽",s:"Jun–Sep",r:"All India"},
+    {n:"ராகி | Ragi",e:"🌾",s:"Jun–Sep",r:"Karnataka, TN"},
+    {n:"சோளம் | Jowar",e:"🌾",s:"Jun–Sep",r:"Maharashtra"},
+    {n:"கம்பு | Bajra",e:"🌾",s:"Jun–Sep",r:"Rajasthan"},
+    {n:"வரகு | Kodo Millet",e:"🌾",s:"Jun–Sep",r:"MP, CG"},
+    {n:"சாமை | Little Millet",e:"🌾",s:"Jun–Sep",r:"South India"},
+    {n:"தினை | Foxtail Millet",e:"🌾",s:"Jun–Sep",r:"AP, TN"},
+    {n:"Barley",e:"🌾",s:"Nov–Mar",r:"UP, Rajasthan"},
+    {n:"Oats",e:"🌾",s:"Nov–Mar",r:"Punjab"},
+  ],
+  "பருப்புகள் | Pulses": [
+    {n:"கடலை | Chickpea",e:"🫘",s:"Nov–Feb",r:"MP, Rajasthan"},
+    {n:"துவரை | Pigeon Pea",e:"🫘",s:"Jun–Sep",r:"Maharashtra"},
+    {n:"உளுந்து | Black Gram",e:"🫘",s:"Jun–Sep",r:"All India"},
+    {n:"பயறு | Green Gram",e:"🫘",s:"Jun–Sep",r:"All India"},
+    {n:"மசூர் | Lentil",e:"🫘",s:"Nov–Feb",r:"MP, UP"},
+    {n:"ராஜ்மா | Kidney Bean",e:"🫘",s:"Nov–Feb",r:"Himachal"},
+    {n:"காராமணி | Cowpea",e:"🫘",s:"Jun–Sep",r:"All India"},
+    {n:"கொள்ளு | Horse Gram",e:"🫘",s:"Jun–Sep",r:"South India"},
+    {n:"அவரை | Cluster Bean",e:"🫘",s:"Jun–Sep",r:"Rajasthan"},
+    {n:"Soybean",e:"🫘",s:"Jun–Sep",r:"MP, Maharashtra"},
+    {n:"Field Pea",e:"🫘",s:"Nov–Feb",r:"UP, MP"},
+    {n:"Moth Bean",e:"🫘",s:"Jun–Sep",r:"Rajasthan"},
+  ],
+  "எண்ணெய் வித்துகள் | Oilseeds": [
+    {n:"நிலக்கடலை | Groundnut",e:"🥜",s:"Jun–Sep",r:"Gujarat, AP"},
+    {n:"கடுகு | Mustard",e:"🌿",s:"Nov–Feb",r:"Rajasthan, UP"},
+    {n:"எள் | Sesame",e:"🌿",s:"Jun–Sep",r:"Gujarat, WB"},
+    {n:"சூரியகாந்தி | Sunflower",e:"🌻",s:"All year",r:"Karnataka"},
+    {n:"ஆமணக்கு | Castor",e:"🌿",s:"Jun–Sep",r:"Gujarat, AP"},
+    {n:"தேங்காய் | Coconut",e:"🥥",s:"Perennial",r:"Kerala, TN"},
+    {n:"பனை | Palm Oil",e:"🌴",s:"Perennial",r:"AP, Telangana"},
+    {n:"Linseed",e:"🌿",s:"Nov–Feb",r:"MP, CG"},
+    {n:"Safflower",e:"🌼",s:"Nov–Feb",r:"Maharashtra"},
+    {n:"Niger (Ramtil)",e:"🌿",s:"Jun–Sep",r:"Odisha, CG"},
+    {n:"Rapeseed",e:"🌿",s:"Nov–Feb",r:"North India"},
+  ],
+  "வணிக பயிர்கள் | Cash Crops": [
+    {n:"கரும்பு | Sugarcane",e:"🎋",s:"Annual",r:"UP, Maharashtra"},
+    {n:"பருத்தி | Cotton",e:"🌸",s:"Jun–Sep",r:"Gujarat, Maharashtra"},
+    {n:"சணல் | Jute",e:"🌿",s:"Mar–Jun",r:"WB, Bihar"},
+    {n:"தேயிலை | Tea",e:"🍵",s:"Perennial",r:"Assam, Kerala"},
+    {n:"காபி | Coffee",e:"☕",s:"Perennial",r:"Karnataka"},
+    {n:"ரப்பர் | Rubber",e:"🌳",s:"Perennial",r:"Kerala"},
+    {n:"Tobacco",e:"🌿",s:"Both",r:"AP, Gujarat"},
+    {n:"Hemp",e:"🌿",s:"Jun–Sep",r:"Uttarakhand"},
+  ],
+  "காய்கறிகள் | Vegetables": [
+    {n:"தக்காளி | Tomato",e:"🍅",s:"All year",r:"AP, Maharashtra"},
+    {n:"வெங்காயம் | Onion",e:"🧅",s:"Both",r:"Maharashtra"},
+    {n:"உருளை | Potato",e:"🥔",s:"Nov–Feb",r:"UP, WB"},
+    {n:"கத்திரி | Brinjal",e:"🍆",s:"All year",r:"WB, Odisha"},
+    {n:"மிளகாய் | Chilli",e:"🌶️",s:"Jun–Sep",r:"AP, Karnataka"},
+    {n:"வெண்டை | Okra",e:"🌿",s:"All year",r:"All India"},
+    {n:"பூண்டு | Garlic",e:"🧄",s:"Nov–Feb",r:"MP, Gujarat"},
+    {n:"இஞ்சி | Ginger",e:"🫚",s:"Jun–Sep",r:"Kerala"},
+    {n:"பீட்ரூட் | Beetroot",e:"🫀",s:"Nov–Feb",r:"All India"},
+    {n:"கேரட் | Carrot",e:"🥕",s:"Nov–Feb",r:"Punjab, HP"},
+    {n:"காலிஃப்ளவர் | Cauliflower",e:"🥦",s:"Nov–Feb",r:"WB, Bihar"},
+    {n:"கோஸ் | Cabbage",e:"🥬",s:"Nov–Feb",r:"WB, Assam"},
+    {n:"பரங்கி | Pumpkin",e:"🎃",s:"Jun–Sep",r:"All India"},
+    {n:"வெள்ளரி | Cucumber",e:"🥒",s:"Summer",r:"All India"},
+    {n:"முருங்கை | Drumstick",e:"🌿",s:"Perennial",r:"TN, AP"},
+    {n:"பீன்ஸ் | Beans",e:"🫛",s:"All year",r:"All India"},
+    {n:"சர்க்கரைவள்ளி | Sweet Potato",e:"🍠",s:"Jun–Sep",r:"Odisha"},
+    {n:"வாழைத்தண்டு | Banana Stem",e:"🌿",s:"Perennial",r:"TN, AP"},
+    {n:"குடைமிளகாய் | Capsicum",e:"🫑",s:"All year",r:"HP, Karnataka"},
+    {n:"Broccoli",e:"🥦",s:"Nov–Feb",r:"HP"},
+    {n:"Spinach",e:"🥬",s:"Nov–Feb",r:"All India"},
+    {n:"Bitter Gourd",e:"🫑",s:"Summer",r:"All India"},
+    {n:"Bottle Gourd",e:"🫙",s:"Summer",r:"All India"},
+    {n:"Snake Gourd",e:"🌿",s:"Jun–Sep",r:"South India"},
+    {n:"Ash Gourd",e:"🫙",s:"Jun–Sep",r:"All India"},
+    {n:"Ridge Gourd",e:"🌿",s:"Jun–Sep",r:"All India"},
+    {n:"Radish",e:"🌱",s:"Nov–Feb",r:"North India"},
+    {n:"Turnip",e:"🌱",s:"Nov–Feb",r:"Punjab, HP"},
+    {n:"Coriander",e:"🌿",s:"Nov–Feb",r:"Rajasthan"},
+    {n:"Mint",e:"🌿",s:"Summer",r:"UP, Punjab"},
+    {n:"Fenugreek",e:"🌿",s:"Nov–Feb",r:"Rajasthan"},
+    {n:"Celery",e:"🌿",s:"Nov–Feb",r:"HP"},
+    {n:"Leek",e:"🧅",s:"Nov–Feb",r:"North India"},
+    {n:"Yam",e:"🍠",s:"Jun–Sep",r:"South India"},
+    {n:"Colocasia",e:"🌿",s:"Jun–Sep",r:"All India"},
+    {n:"Elephant Foot Yam",e:"🍠",s:"Jun–Sep",r:"Kerala"},
+  ],
+  "பழங்கள் | Fruits": [
+    {n:"மாம்பழம் | Mango",e:"🥭",s:"Summer",r:"UP, AP"},
+    {n:"வாழை | Banana",e:"🍌",s:"Perennial",r:"TN, AP"},
+    {n:"திராட்சை | Grapes",e:"🍇",s:"Annual",r:"Maharashtra"},
+    {n:"கொய்யா | Guava",e:"🍐",s:"All year",r:"UP, MP"},
+    {n:"பப்பாளி | Papaya",e:"🍈",s:"All year",r:"AP, TN"},
+    {n:"மாதுளை | Pomegranate",e:"🍎",s:"All year",r:"Maharashtra"},
+    {n:"ஆரஞ்சு | Orange",e:"🍊",s:"All year",r:"Nagpur"},
+    {n:"எலுமிச்சை | Lemon",e:"🍋",s:"All year",r:"AP, Gujarat"},
+    {n:"அன்னாசி | Pineapple",e:"🍍",s:"All year",r:"Kerala, Assam"},
+    {n:"சப்போட்டா | Sapota",e:"🍑",s:"All year",r:"Gujarat, AP"},
+    {n:"பலாப்பழம் | Jackfruit",e:"🍈",s:"Summer",r:"Kerala, TN"},
+    {n:"Avocado",e:"🥑",s:"Summer",r:"TN, Kerala"},
+    {n:"லிட்சி | Litchi",e:"🍒",s:"Summer",r:"Bihar, WB"},
+    {n:"ஆப்பிள் | Apple",e:"🍎",s:"Summer",r:"HP, J&K"},
+    {n:"பேரி | Pear",e:"🍐",s:"Summer",r:"HP, J&K"},
+    {n:"பிளம் | Plum",e:"🍑",s:"Summer",r:"HP"},
+    {n:"ஸ்ட்ராபெர்ரி | Strawberry",e:"🍓",s:"Winter",r:"HP, Maharashtra"},
+    {n:"Kiwi",e:"🥝",s:"Annual",r:"HP, Arunachal"},
+    {n:"Dragon Fruit",e:"🍈",s:"All year",r:"Karnataka"},
+    {n:"ஆமலா | Amla",e:"🍏",s:"Annual",r:"UP, MP"},
+    {n:"நெல்லி | Tamarind",e:"🌿",s:"Perennial",r:"AP, TN"},
+    {n:"வால்நட் | Walnut",e:"🌰",s:"Annual",r:"J&K, HP"},
+    {n:"Cherry",e:"🍒",s:"Summer",r:"J&K, HP"},
+    {n:"Custard Apple",e:"🍏",s:"Summer",r:"AP, Gujarat"},
+    {n:"Jamun",e:"🫐",s:"Summer",r:"All India"},
+  ],
+  "மசாலா | Spices": [
+    {n:"மிளகு | Black Pepper",e:"🌶️",s:"Perennial",r:"Kerala"},
+    {n:"ஏலக்காய் | Cardamom",e:"🌿",s:"Perennial",r:"Kerala"},
+    {n:"மஞ்சள் | Turmeric",e:"🟡",s:"Jun–Sep",r:"AP, Odisha"},
+    {n:"சீரகம் | Cumin",e:"🌿",s:"Nov–Feb",r:"Rajasthan"},
+    {n:"கொத்தமல்லி | Coriander Seed",e:"🌿",s:"Nov–Feb",r:"Rajasthan"},
+    {n:"சோம்பு | Fennel",e:"🌿",s:"Nov–Feb",r:"Gujarat"},
+    {n:"கிராம்பு | Clove",e:"🌿",s:"Perennial",r:"Kerala"},
+    {n:"இலவங்கம் | Cinnamon",e:"🌿",s:"Perennial",r:"Kerala"},
+    {n:"ஜாதிக்காய் | Nutmeg",e:"🌰",s:"Perennial",r:"Kerala"},
+    {n:"வெனிலா | Vanilla",e:"🌸",s:"Perennial",r:"Karnataka"},
+    {n:"குங்குமப்பூ | Saffron",e:"🌸",s:"Annual",r:"J&K"},
+    {n:"கரும்புளி | Star Anise",e:"⭐",s:"Perennial",r:"Arunachal"},
+    {n:"Ajwain",e:"🌿",s:"Nov–Feb",r:"Rajasthan"},
+    {n:"Asafoetida",e:"🌿",s:"Rabi",r:"Kashmir"},
+  ],
+  "பூக்கள் | Flowers": [
+    {n:"ரோஜா | Rose",e:"🌹",s:"All year",r:"Karnataka, TN"},
+    {n:"மல்லிகை | Jasmine",e:"🌸",s:"All year",r:"TN, Karnataka"},
+    {n:"சேவந்தி | Marigold",e:"🌼",s:"All year",r:"All India"},
+    {n:"தாமரை | Lotus",e:"🪷",s:"All year",r:"WB, Bihar"},
+    {n:"Gladiolus",e:"🌷",s:"All year",r:"Karnataka"},
+    {n:"Gerbera",e:"🌻",s:"All year",r:"Karnataka"},
+    {n:"Chrysanthemum",e:"🌼",s:"All year",r:"TN"},
+    {n:"Tuberose",e:"🌸",s:"All year",r:"TN"},
+    {n:"வெற்றிலை | Betel Leaf",e:"🍃",s:"Perennial",r:"WB, Odisha"},
+    {n:"பாக்கு | Areca Nut",e:"🌴",s:"Perennial",r:"Karnataka"},
+    {n:"முந்திரி | Cashew",e:"🌰",s:"Annual",r:"Kerala, Goa"},
+  ],
+};
+
+const ALL_CROP_LIST = Object.values(CROPS).flat();
+const ALL_CROP_NAMES = ALL_CROP_LIST.map(c => c.n);
+const CROP_EMOJI_MAP = ALL_CROP_LIST.reduce((a,c) => { a[c.n]=c.e; return a; }, {});
+
+/* ══════════════════════════════════════
+   STYLES — Farmer-Friendly
+   • Warm greens + sunshine yellow + sky blue
+   • 48px+ tap targets
+   • Large readable fonts
+   • Lots of white space
+   • Picture-led navigation
+   • Simple Tamil/English labels
+══════════════════════════════════════ */
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@600;700;800;900&family=Hind:wght@400;500;600&display=swap');
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{background:#1a6b3c;height:100%;}
+
+:root{
+  --green-dark:  #1a5c30;
+  --green:       #1e7a3e;
+  --green-mid:   #2d9659;
+  --green-light: #e6f7ed;
+  --green-pale:  #f0faf3;
+  --sun:         #f5a623;
+  --sun-light:   #fff8eb;
+  --sky:         #2980b9;
+  --sky-light:   #ebf5fb;
+  --red:         #c0392b;
+  --red-light:   #fdf0ee;
+  --page-bg:     #f5f7f5;
+  --card-bg:     #ffffff;
+  --text-dark:   #1a2e1e;
+  --text-mid:    #4a6b4f;
+  --text-soft:   #7a9a7e;
+  --border:      #d4e8d8;
+  --shadow:      0 3px 16px rgba(26,92,48,0.10);
+  --shadow-lg:   0 8px 32px rgba(26,92,48,0.16);
+}
+
+.app{
+  font-family:'Hind',sans-serif;
+  background:var(--page-bg);
+  min-height:100vh;
+  max-width:430px;
+  margin:0 auto;
+  box-shadow:0 0 60px rgba(0,0,0,0.4);
+  overflow-x:hidden;
+  position:relative;
+}
+
+/* ── TOP BAR ── */
+.topbar{
+  background:var(--green-dark);
+  padding:14px 18px 12px;
+  display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;
+}
+.topbar-brand{display:flex;align-items:center;gap:10px;}
+.topbar-icon{
+  width:40px;height:40px;background:var(--sun);
+  border-radius:12px;display:flex;align-items:center;justify-content:center;
+  font-size:22px;
+}
+.topbar-name{
+  font-family:'Nunito',sans-serif;
+  font-size:20px;font-weight:900;color:#ffffff;
+  letter-spacing:-0.3px;line-height:1;
+}
+.topbar-tagline{font-size:11px;color:rgba(255,255,255,0.6);margin-top:1px;}
+.topbar-weather{
+  background:rgba(255,255,255,0.12);
+  border:1px solid rgba(255,255,255,0.2);
+  border-radius:20px;
+  padding:6px 12px;
+  display:flex;align-items:center;gap:6px;
+  font-family:'Nunito',sans-serif;
+  font-size:13px;font-weight:700;color:#fff;
+}
+
+/* ── PAGE ── */
+.page{padding:16px 14px 100px;animation:pagein 0.25s ease both;}
+@keyframes pagein{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── SECTION TITLE ── */
+.section-title{
+  font-family:'Nunito',sans-serif;
+  font-size:18px;font-weight:900;color:var(--text-dark);
+  margin:20px 0 12px 0;
+  display:flex;align-items:center;gap:8px;
+}
+.section-title:first-child{margin-top:0;}
+
+/* ── CARDS ── */
+.card{
+  background:var(--card-bg);
+  border-radius:20px;
+  border:2px solid var(--border);
+  padding:18px;
+  margin-bottom:14px;
+  box-shadow:var(--shadow);
+}
+.card-green{
+  background:linear-gradient(135deg,var(--green) 0%,var(--green-dark) 100%);
+  border-radius:20px;border:none;
+  padding:20px;margin-bottom:14px;
+  position:relative;overflow:hidden;
+}
+.card-sun{
+  background:linear-gradient(135deg,#f5a623 0%,#e67e22 100%);
+  border-radius:20px;border:none;
+  padding:18px;margin-bottom:14px;
+}
+.card-sky{
+  background:linear-gradient(135deg,var(--sky) 0%,#1a5276 100%);
+  border-radius:20px;border:none;
+  padding:18px;margin-bottom:14px;
+}
+
+/* ── WEATHER BIG ── */
+.wx-big{
+  background:linear-gradient(145deg,#1565a8 0%,#0d3b6e 100%);
+  border-radius:20px;
+  padding:22px 20px;
+  margin-bottom:14px;
+  position:relative;overflow:hidden;
+}
+.wx-big::after{
+  content:'';position:absolute;
+  top:-40px;right:-40px;
+  width:160px;height:160px;
+  background:rgba(255,255,255,0.06);
+  border-radius:50%;
+}
+.wx-temp-row{display:flex;justify-content:space-between;align-items:center;}
+.wx-temp{
+  font-family:'Nunito',sans-serif;
+  font-size:64px;font-weight:900;
+  color:#fff;line-height:1;
+}
+.wx-emoji{font-size:64px;filter:drop-shadow(0 4px 8px rgba(0,0,0,0.2));}
+.wx-cond{font-size:16px;color:rgba(255,255,255,0.8);font-weight:600;margin-top:6px;}
+.wx-loc{font-size:12px;color:rgba(255,255,255,0.5);margin-top:2px;display:flex;align-items:center;gap:4px;}
+.wx-pills{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;}
+.wx-pill{
+  background:rgba(255,255,255,0.15);
+  border:1px solid rgba(255,255,255,0.2);
+  border-radius:30px;
+  padding:6px 14px;
+  font-size:13px;font-weight:700;color:#fff;
+  display:flex;align-items:center;gap:5px;
+}
+.fc-row{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:14px;}
+.fc-day{
+  background:rgba(255,255,255,0.1);
+  border:1px solid rgba(255,255,255,0.12);
+  border-radius:14px;
+  padding:8px 4px;text-align:center;
+}
+.fc-day-name{font-size:10px;color:rgba(255,255,255,0.55);margin-bottom:4px;font-weight:600;}
+.fc-day-temp{font-family:'Nunito',sans-serif;font-size:13px;font-weight:800;color:#fff;margin-top:4px;}
+.fc-day-rain{font-size:9px;color:#7EC8E3;margin-top:2px;font-weight:600;}
+.wx-warn{
+  background:rgba(255,220,50,0.18);
+  border:1.5px solid rgba(255,220,50,0.5);
+  border-radius:12px;padding:9px 14px;
+  font-size:13px;font-weight:700;color:#ffe066;
+  margin-top:12px;display:flex;align-items:center;gap:7px;
+}
+
+/* ── BIG STAT TILES ── */
+.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
+.stat-tile{
+  border-radius:18px;
+  padding:18px 14px;
+  min-height:100px;
+  display:flex;flex-direction:column;
+  justify-content:space-between;
+  border:2px solid transparent;
+}
+.stat-icon{font-size:30px;margin-bottom:8px;}
+.stat-val{
+  font-family:'Nunito',sans-serif;
+  font-size:26px;font-weight:900;line-height:1;
+}
+.stat-name{
+  font-size:13px;font-weight:700;
+  margin-top:5px;line-height:1.2;
+}
+.stat-sub{font-size:11px;margin-top:3px;opacity:0.65;}
+
+/* ── CROP RECOMMENDATION ROWS ── */
+.crop-rec{
+  display:flex;align-items:center;gap:14px;
+  padding:14px;
+  background:var(--card-bg);
+  border-radius:16px;
+  border:2px solid var(--border);
+  margin-bottom:10px;
+  box-shadow:var(--shadow);
+}
+.crop-rec-emoji{
+  width:56px;height:56px;
+  border-radius:16px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:30px;
+  flex-shrink:0;
+}
+.crop-rec-info{flex:1;}
+.crop-rec-name{
+  font-family:'Nunito',sans-serif;
+  font-size:17px;font-weight:800;
+  color:var(--text-dark);
+}
+.crop-rec-meta{font-size:12px;color:var(--text-soft);margin-top:2px;font-weight:600;}
+.crop-bar{background:var(--green-light);border-radius:6px;height:8px;margin-top:8px;overflow:hidden;}
+.crop-bar-fill{height:100%;border-radius:6px;transition:width 1.4s ease;}
+.crop-rec-score{
+  font-family:'Nunito',sans-serif;
+  font-size:22px;font-weight:900;
+  flex-shrink:0;
+}
+
+/* ── ADVISORY BOX ── */
+.advisory{
+  background:var(--sun-light);
+  border:2.5px solid var(--sun);
+  border-radius:18px;
+  padding:16px;
+  display:flex;gap:12px;
+  margin-bottom:14px;
+}
+.advisory-icon{font-size:28px;flex-shrink:0;}
+.advisory-title{font-family:'Nunito',sans-serif;font-size:15px;font-weight:800;color:#7a4800;margin-bottom:4px;}
+.advisory-text{font-size:14px;color:#5a3800;line-height:1.6;font-weight:500;}
+
+/* ── INPUT FIELDS ── */
+.field{margin-bottom:14px;}
+.field-label{
+  font-family:'Nunito',sans-serif;
+  font-size:14px;font-weight:800;
+  color:var(--text-dark);
+  margin-bottom:6px;
+  display:flex;align-items:center;gap:6px;
+}
+.field-input{
+  width:100%;padding:14px 16px;
+  border:2.5px solid var(--border);
+  border-radius:14px;
+  font-family:'Hind',sans-serif;
+  font-size:16px;font-weight:600;
+  color:var(--text-dark);
+  background:#fff;
+  outline:none;
+  transition:border-color 0.15s,box-shadow 0.15s;
+  -webkit-appearance:none;
+}
+.field-input:focus{border-color:var(--green-mid);box-shadow:0 0 0 4px rgba(45,150,89,0.12);}
+.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+
+/* ── BUTTONS ── */
+.btn-big{
+  width:100%;
+  background:var(--green);
+  color:#fff;
+  border:none;border-radius:16px;
+  padding:18px;
+  font-family:'Nunito',sans-serif;
+  font-size:18px;font-weight:900;
+  cursor:pointer;
+  display:flex;align-items:center;justify-content:center;gap:10px;
+  margin-top:6px;
+  box-shadow:0 4px 18px rgba(30,122,62,0.35);
+  transition:transform 0.12s,box-shadow 0.12s;
+  letter-spacing:0.2px;
+}
+.btn-big:hover{transform:translateY(-2px);box-shadow:0 6px 24px rgba(30,122,62,0.45);}
+.btn-big:active{transform:translateY(0);}
+.btn-big:disabled{opacity:0.55;cursor:not-allowed;transform:none;}
+.btn-outline{
+  background:transparent;color:var(--green);
+  border:2.5px solid var(--green);
+  border-radius:14px;padding:14px;
+  font-family:'Nunito',sans-serif;font-size:16px;font-weight:800;
+  cursor:pointer;width:100%;margin-top:8px;
+  transition:all 0.15s;
+}
+.btn-outline:hover{background:var(--green-light);}
+
+/* ── RESULT BLOCKS ── */
+.result-block{
+  border-radius:18px;
+  padding:18px;margin-bottom:12px;
+  border:3px solid;
+}
+.result-heading{
+  font-family:'Nunito',sans-serif;
+  font-size:22px;font-weight:900;
+  margin:6px 0;
+}
+.badge-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}
+.badge{
+  display:inline-flex;align-items:center;gap:4px;
+  border-radius:30px;padding:5px 14px;
+  font-family:'Nunito',sans-serif;
+  font-size:12px;font-weight:800;letter-spacing:0.2px;
+}
+
+/* ── LIST ROWS ── */
+.list-row{
+  display:flex;align-items:flex-start;gap:12px;
+  padding:12px 0;
+  border-bottom:1.5px solid var(--border);
+  font-size:15px;font-weight:500;color:var(--text-dark);
+  line-height:1.5;
+}
+.list-row:last-child{border-bottom:none;}
+.list-bullet{
+  width:10px;height:10px;border-radius:50%;
+  background:var(--green-mid);
+  flex-shrink:0;margin-top:6px;
+}
+
+/* ── TREATMENT STEPS ── */
+.step-row{display:flex;gap:14px;align-items:flex-start;padding:12px 0;border-bottom:1.5px solid var(--border);}
+.step-row:last-child{border-bottom:none;}
+.step-num{
+  width:34px;height:34px;flex-shrink:0;
+  border-radius:50%;
+  background:var(--green);
+  color:#fff;display:flex;align-items:center;justify-content:center;
+  font-family:'Nunito',sans-serif;font-size:16px;font-weight:900;
+}
+.step-text{font-size:15px;color:var(--text-dark);line-height:1.6;padding-top:5px;font-weight:500;}
+
+/* ── SCAN ZONE ── */
+.scan-zone{
+  border:3px dashed var(--green-mid);
+  border-radius:22px;
+  background:var(--green-pale);
+  padding:36px 20px;
+  text-align:center;cursor:pointer;
+  transition:all 0.2s;
+}
+.scan-zone:hover,
+.scan-zone:active{background:var(--green-light);border-color:var(--green);}
+.scan-zone-icon{font-size:56px;margin-bottom:12px;}
+.scan-zone-title{
+  font-family:'Nunito',sans-serif;
+  font-size:20px;font-weight:900;color:var(--text-dark);margin-bottom:6px;
+}
+.scan-zone-sub{font-size:15px;color:var(--text-mid);font-weight:600;}
+
+/* ── MARKET PRICE HERO ── */
+.price-hero{
+  background:linear-gradient(135deg,#0d3b22 0%,var(--green-dark) 100%);
+  border-radius:20px;padding:22px;
+  margin-bottom:14px;
+  position:relative;overflow:hidden;
+}
+.price-hero::before{
+  content:'';position:absolute;
+  top:-50px;right:-50px;
+  width:180px;height:180px;
+  background:rgba(245,166,35,0.1);
+  border-radius:50%;
+}
+.price-big{
+  font-family:'Nunito',sans-serif;
+  font-size:52px;font-weight:900;
+  color:#fff;line-height:1;
+}
+.price-unit{font-size:15px;color:rgba(255,255,255,0.6);margin-top:4px;font-weight:600;}
+.trend-chip{
+  border-radius:30px;padding:7px 16px;
+  font-family:'Nunito',sans-serif;font-size:14px;font-weight:800;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.mandi-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 0;
+  border-bottom:2px solid var(--border);
+}
+.mandi-row:last-child{border-bottom:none;}
+.mandi-name{font-family:'Nunito',sans-serif;font-size:16px;font-weight:800;color:var(--text-dark);}
+.mandi-vol{font-size:12px;color:var(--text-soft);margin-top:2px;font-weight:600;}
+.mandi-price{font-family:'Nunito',sans-serif;font-size:24px;font-weight:900;}
+.mandi-arrow{font-size:20px;font-weight:900;}
+
+/* ── FORECAST BOXES ── */
+.fc-boxes{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px;}
+.fc-box{border-radius:14px;padding:14px 10px;text-align:center;}
+.fc-box-val{font-family:'Nunito',sans-serif;font-size:20px;font-weight:900;}
+.fc-box-lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;opacity:0.65;}
+.fc-box-chg{font-size:12px;font-weight:800;margin-top:4px;}
+
+/* ── VOICE ── */
+.voice-orb-wrap{display:flex;flex-direction:column;align-items:center;padding:32px 0 20px;}
+.voice-orb{
+  width:120px;height:120px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-size:52px;cursor:pointer;
+  transition:transform 0.15s;
+}
+.orb-idle{background:var(--green);box-shadow:0 6px 24px rgba(30,122,62,0.4);}
+.orb-listen{
+  background:var(--red);
+  box-shadow:0 0 0 0 rgba(192,57,43,0.5);
+  animation:orbpulse 1.2s infinite;
+}
+@keyframes orbpulse{0%,100%{box-shadow:0 0 0 0 rgba(192,57,43,0.5)}60%{box-shadow:0 0 0 24px rgba(192,57,43,0)}}
+.voice-orb:hover{transform:scale(1.05);}
+.orb-label{
+  font-family:'Nunito',sans-serif;
+  font-size:17px;font-weight:800;
+  color:var(--text-mid);margin-top:14px;
+}
+.lang-tabs{display:flex;gap:8px;margin-bottom:16px;}
+.lang-tab{
+  flex:1;text-align:center;
+  padding:12px 8px;border-radius:12px;cursor:pointer;
+  font-family:'Nunito',sans-serif;font-size:15px;font-weight:800;
+  border:2.5px solid var(--border);color:var(--text-soft);
+  background:#fff;transition:all 0.15s;
+}
+.lang-tab.active{background:var(--green);color:#fff;border-color:var(--green);}
+.chat-area{display:flex;flex-direction:column;gap:10px;max-height:280px;overflow-y:auto;padding:10px 0;}
+.bubble-user{
+  background:var(--green);color:#fff;
+  border-radius:20px 20px 4px 20px;
+  padding:12px 16px;
+  font-size:15px;line-height:1.5;font-weight:600;
+  align-self:flex-end;max-width:82%;
+}
+.bubble-ai{
+  background:#fff;border:2px solid var(--border);
+  border-radius:20px 20px 20px 4px;
+  padding:12px 16px;
+  font-size:15px;color:var(--text-dark);
+  line-height:1.6;font-weight:500;
+  align-self:flex-start;max-width:88%;
+}
+.typing{display:flex;gap:5px;align-items:center;padding:4px 0;}
+.typing-dot{
+  width:8px;height:8px;background:var(--green-mid);
+  border-radius:50%;animation:tdot 0.8s infinite;
+}
+.typing-dot:nth-child(2){animation-delay:0.16s;}
+.typing-dot:nth-child(3){animation-delay:0.32s;}
+@keyframes tdot{0%,80%,100%{transform:scale(1)}40%{transform:scale(1.4)}}
+.quick-q{
+  display:inline-block;
+  background:#fff;border:2px solid var(--border);
+  border-radius:30px;padding:9px 16px;
+  font-family:'Nunito',sans-serif;font-size:14px;font-weight:700;
+  color:var(--text-dark);cursor:pointer;margin:4px;
+  transition:all 0.15s;
+}
+.quick-q:hover,
+.quick-q:active{background:var(--green);color:#fff;border-color:var(--green);}
+
+/* ── CROP BROWSER ── */
+.cat-strip{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;margin-bottom:14px;scrollbar-width:none;}
+.cat-strip::-webkit-scrollbar{display:none;}
+.cat-chip{
+  flex-shrink:0;
+  padding:10px 18px;border-radius:30px;cursor:pointer;
+  font-family:'Nunito',sans-serif;font-size:14px;font-weight:800;
+  border:2.5px solid var(--border);
+  background:#fff;color:var(--text-mid);
+  white-space:nowrap;transition:all 0.15s;
+}
+.cat-chip.active{background:var(--green);color:#fff;border-color:var(--green);}
+.crop-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.crop-tile{
+  background:#fff;border:2.5px solid var(--border);
+  border-radius:18px;padding:16px 12px;
+  cursor:pointer;transition:all 0.15s;
+  display:flex;flex-direction:column;gap:4px;
+}
+.crop-tile:hover,.crop-tile:active{border-color:var(--green-mid);background:var(--green-pale);}
+.crop-tile-emoji{font-size:32px;margin-bottom:4px;}
+.crop-tile-name{
+  font-family:'Nunito',sans-serif;
+  font-size:13px;font-weight:800;color:var(--text-dark);line-height:1.3;
+}
+.crop-tile-season{font-size:11px;color:var(--text-soft);font-weight:600;}
+.crop-tile-region{font-size:11px;color:var(--green);font-weight:700;margin-top:2px;}
+
+/* ── DETAIL SHEET ── */
+.detail-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,0.5);
+  z-index:200;display:flex;align-items:flex-end;
+}
+.detail-sheet{
+  background:#fff;
+  border-radius:28px 28px 0 0;
+  padding:24px;width:100%;max-width:430px;
+  margin:0 auto;max-height:82vh;overflow-y:auto;
+}
+.detail-sheet-handle{
+  width:40px;height:4px;background:var(--border);
+  border-radius:4px;margin:0 auto 20px;
+}
+
+/* ── SOIL HEALTH RING ── */
+.health-ring{
+  width:96px;height:96px;border-radius:50%;
+  border:5px solid;
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.health-ring-n{font-family:'Nunito',sans-serif;font-size:26px;font-weight:900;line-height:1;}
+.health-ring-l{font-size:9px;font-weight:800;letter-spacing:0.8px;text-transform:uppercase;margin-top:2px;}
+
+/* ── PORTFOLIO ALLOC ── */
+.alloc-bar{display:flex;height:14px;border-radius:30px;overflow:hidden;margin:14px 0 10px;}
+.alloc-seg{height:100%;transition:width 1s;}
+.portfolio-card{
+  background:#fff;border:2.5px solid var(--border);
+  border-radius:18px;padding:16px;margin-bottom:12px;
+}
+.portfolio-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
+.portfolio-crop-name{
+  font-family:'Nunito',sans-serif;
+  font-size:18px;font-weight:900;
+  color:var(--text-dark);display:flex;align-items:center;gap:8px;
+}
+.portfolio-alloc{font-family:'Nunito',sans-serif;font-size:30px;font-weight:900;}
+.risk-tag{
+  border-radius:30px;padding:4px 12px;
+  font-family:'Nunito',sans-serif;font-size:12px;font-weight:800;
+  display:inline-block;
+}
+.crop-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+.crop-metric{border-radius:12px;padding:10px;text-align:center;background:var(--page-bg);}
+.crop-metric-val{font-family:'Nunito',sans-serif;font-size:15px;font-weight:900;color:var(--text-dark);}
+.crop-metric-lbl{font-size:10px;font-weight:700;color:var(--text-soft);text-transform:uppercase;letter-spacing:0.5px;margin-top:3px;}
+
+/* ── BOTTOM NAV ── */
+.bottom-nav{
+  position:fixed;bottom:0;
+  left:50%;transform:translateX(-50%);
+  width:100%;max-width:430px;
+  background:#fff;
+  border-top:2.5px solid var(--border);
+  display:flex;
+  padding:6px 0 env(safe-area-inset-bottom,6px);
+  z-index:100;
+  box-shadow:0 -4px 20px rgba(26,92,48,0.10);
+}
+.nav-btn{
+  flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+  border:none;background:none;cursor:pointer;
+  padding:8px 4px 6px;
+  font-family:'Nunito',sans-serif;font-size:11px;font-weight:800;
+  color:#b0c4b5;
+  border-top:3px solid transparent;
+  margin-top:-1px;transition:color 0.15s;
+}
+.nav-btn.active{color:var(--green);border-top-color:var(--green);}
+.nav-icon{font-size:26px;transition:transform 0.2s;}
+.nav-btn.active .nav-icon{transform:scale(1.15);}
+
+/* ── SPINNER ── */
+.spin{width:20px;height:20px;border:3px solid rgba(255,255,255,0.35);border-top-color:#fff;border-radius:50%;animation:rot 0.65s linear infinite;}
+@keyframes rot{to{transform:rotate(360deg)}}
+
+/* ── SKELETON ── */
+.skel{background:linear-gradient(90deg,#e8f2ea 25%,#dceede 50%,#e8f2ea 75%);background-size:200% 100%;animation:skel 1.5s infinite;border-radius:10px;}
+@keyframes skel{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* ── SEARCH INPUT ── */
+.search-wrap{position:relative;margin-bottom:12px;}
+.search-ico{position:absolute;left:16px;top:50%;transform:translateY(-50%);font-size:18px;pointer-events:none;}
+.search-input{
+  width:100%;padding:14px 16px 14px 44px;
+  border:2.5px solid var(--border);border-radius:16px;
+  font-family:'Hind',sans-serif;font-size:16px;font-weight:600;
+  color:var(--text-dark);background:#fff;outline:none;
+  transition:border-color 0.15s;
+}
+.search-input:focus{border-color:var(--green-mid);}
+
+/* ── PAGE TOGGLE ── */
+.toggle-bar{
+  display:flex;background:#fff;
+  border:2.5px solid var(--border);
+  border-radius:16px;padding:4px;
+  gap:4px;margin-bottom:16px;
+}
+.toggle-opt{
+  flex:1;text-align:center;padding:11px 8px;
+  border-radius:12px;cursor:pointer;
+  font-family:'Nunito',sans-serif;font-size:14px;font-weight:800;
+  color:var(--text-soft);transition:all 0.15s;
+}
+.toggle-opt.active{background:var(--green);color:#fff;}
+
+/* ── SOUND WAVE & MISC ANIMATIONS ── */
+@keyframes wave {
+  0%,100%{height:6px}
+  50%{height:28px}
+}
+@keyframes pulse {
+  0%,100%{opacity:1;box-shadow:0 0 6px #00ff88}
+  50%{opacity:0.5;box-shadow:0 0 12px #00ff88}
+}
+.empty-icon{font-size:52px;margin-bottom:12px;}
+.empty-title{font-family:'Nunito',sans-serif;font-size:18px;font-weight:900;color:var(--text-dark);}
+.empty-sub{font-size:14px;color:var(--text-soft);margin-top:4px;font-weight:600;}
+`;
+
+/* ═══ WEATHER ICON HELPER ═══ */
+const wxIcon = t => {
+  if (!t) return "🌤️";
+  if (t.includes("Sun") || t.includes("Clear")) return "☀️";
+  if (t.includes("Part")) return "⛅";
+  if (t.includes("Cloud") || t.includes("Over")) return "☁️";
+  if (t.includes("Mist") || t.includes("Fog")) return "🌫️";
+  if (t.includes("Thunder") || t.includes("Storm")) return "⛈️";
+  if (t.includes("Snow")) return "❄️";
+  if (t.includes("Rain") || t.includes("Drizzle")) return "🌧️";
+  return "🌤️";
+};
+
+/* ═══ WEATHER CARD ═══ */
+function WeatherCard({ wx, loading }) {
+  if (loading) return (
+    <div className="wx-big">
+      <div style={{display:"flex",justifyContent:"space-between"}}>
+        <div><div className="skel" style={{width:120,height:64,marginBottom:8}}/><div className="skel" style={{width:150,height:18}}/></div>
+        <div className="skel" style={{width:64,height:64,borderRadius:12}}/>
+      </div>
+    </div>
+  );
+  if (!wx) return (
+    <div className="wx-big"><p style={{color:"rgba(255,255,255,0.6)",fontSize:14,fontWeight:600}}>⚠️ Weather not available</p></div>
+  );
+  const c = wx.current, fc = wx.forecast?.forecastday || [], loc = wx.location;
+  return (
+    <div className="wx-big">
+      <div className="wx-temp-row">
+        <div>
+          <div className="wx-loc">📍 {loc.name}, {loc.region}</div>
+          <div className="wx-temp">{Math.round(c.temp_c)}°C</div>
+          <div className="wx-cond">{c.condition.text}</div>
+        </div>
+        <div className="wx-emoji">{wxIcon(c.condition.text)}</div>
+      </div>
+      <div className="wx-pills">
+        <div className="wx-pill">💧 {c.humidity}%</div>
+        <div className="wx-pill">💨 {c.wind_kph} km/h</div>
+        <div className="wx-pill">🌡️ Feels {Math.round(c.feelslike_c)}°C</div>
+      </div>
+      {fc.length > 0 && (
+        <div className="fc-row">
+          {fc.map((d,i) => (
+            <div key={i} className="fc-day">
+              <div className="fc-day-name">{i===0?"Today":new Date(d.date).toLocaleDateString("en",{weekday:"short"})}</div>
+              <div style={{fontSize:20}}>{wxIcon(d.day.condition.text)}</div>
+              <div className="fc-day-temp">{Math.round(d.day.maxtemp_c)}°/{Math.round(d.day.mintemp_c)}°</div>
+              <div className="fc-day-rain">🌧 {d.day.daily_chance_of_rain}%</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {c.precip_mm > 0.5 && <div className="wx-warn">⚠️ மழை வருகிறது | Rain today — avoid field work</div>}
+      {c.temp_c > 38 && <div className="wx-warn" style={{marginTop:8}}>🌡️ வெப்பம் அதிகம் | Extreme heat — water your crops</div>}
+    </div>
+  );
+}
+
+/* ═══ DASHBOARD ═══ */
+function Dashboard({ wx, wxLoading }) {
+  const hr = new Date().getHours();
+  const greet = hr < 12 ? "காலை வணக்கம் 🌅" : hr < 17 ? "மதிய வணக்கம் ☀️" : "மாலை வணக்கம் 🌙";
+  const greetEn = hr < 12 ? "Good Morning" : hr < 17 ? "Good Afternoon" : "Good Evening";
+  const crops = [
+    { n:"நெல் | Paddy", e:"🌾", s:"Kharif", pct:88, c:"#1e7a3e" },
+    { n:"நிலக்கடலை | Groundnut", e:"🥜", s:"Rabi", pct:76, c:"#c8620a" },
+    { n:"மக்காச்சோளம் | Maize", e:"🌽", s:"Kharif", pct:68, c:"#2980b9" },
+  ];
+  const tiles = [
+    { icon:"⚠️", val:"குறைவு\nLow", name:"அபாய நிலை\nRisk Level", sub:"நல்ல நிலை", bg:"#e6f7ed", vc:"#1a6b3c", bc:"#a8ddb8" },
+    { icon:"💰", val:"₹42K", name:"லாப மதிப்பீடு\nEst. Profit", sub:"ஒரு ஏக்கர்", bg:"#fff8eb", vc:"#7a4800", bc:"#ffd480" },
+    { icon:"🐛", val:"இல்லை\nNone", name:"பூச்சி எச்சரிக்கை\nPest Alert", sub:"பாதுகாப்பு நல்லது", bg:"#e6f7ed", vc:"#1a6b3c", bc:"#a8ddb8" },
+    { icon:"💧", val:"25mm", name:"நீர் தேவை\nWater Need", sub:"இந்த வாரம்", bg:"#ebf5fb", vc:"#1a4a8c", bc:"#90caf9" },
+  ];
+  return (
+    <div className="page">
+      {/* GREETING */}
+      <div className="card-green" style={{marginBottom:14}}>
+        <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",fontWeight:700,letterSpacing:1,textTransform:"uppercase",marginBottom:8}}>
+          🟢 நேரடி | LIVE · Tamil Nadu
+        </div>
+        <div style={{fontFamily:"'Nunito',sans-serif",fontSize:13,color:"rgba(255,255,255,0.7)",fontWeight:700,marginBottom:2}}>{greet}</div>
+        <div style={{fontFamily:"'Nunito',sans-serif",fontSize:26,fontWeight:900,color:"#fff",lineHeight:1.1,marginBottom:12}}>{greetEn}, Farmer! 👋</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+          {[
+            ["🌡️",wx?`${Math.round(wx.current.temp_c)}°C`:"—","வெப்பம்\nTemp"],
+            ["💧",wx?`${wx.current.humidity}%`:"—","ஈரப்பதம்\nHumid"],
+            ["🌧️",wx?`${wx.forecast?.forecastday?.[0]?.day?.daily_chance_of_rain??0}%`:"—","மழை வாய்ப்பு\nRain"],
+          ].map(([ico,v,l])=>(
+            <div key={l} style={{background:"rgba(255,255,255,0.12)",border:"1px solid rgba(255,255,255,0.18)",borderRadius:14,padding:"12px 8px",textAlign:"center"}}>
+              <div style={{fontSize:20,marginBottom:4}}>{ico}</div>
+              <div style={{fontFamily:"'Nunito',sans-serif",fontSize:22,fontWeight:900,color:"#fff"}}>{v}</div>
+              <div style={{fontSize:10,color:"rgba(255,255,255,0.55)",fontWeight:700,whiteSpace:"pre-line",marginTop:2,lineHeight:1.3}}>{l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* WEATHER */}
+      <div className="section-title">🌤️ வானிலை | Weather</div>
+      <WeatherCard wx={wx} loading={wxLoading} />
+
+      {/* FARM OVERVIEW */}
+      <div className="section-title">📊 பண்ணை நிலை | Farm Overview</div>
+      <div className="stat-grid">
+        {tiles.map(t => (
+          <div key={t.name} className="stat-tile" style={{background:t.bg,borderColor:t.bc}}>
+            <div className="stat-icon">{t.icon}</div>
+            <div>
+              <div className="stat-val" style={{color:t.vc,whiteSpace:"pre-line",fontSize:t.val.includes("\n")?18:26}}>{t.val}</div>
+              <div className="stat-name" style={{color:t.vc,whiteSpace:"pre-line",fontSize:12}}>{t.name}</div>
+              <div className="stat-sub" style={{color:t.vc}}>{t.sub}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* TOP CROPS */}
+      <div className="section-title">🌾 சிறந்த பயிர்கள் | Top Crops</div>
+      {crops.map(cr => (
+        <div key={cr.n} className="crop-rec">
+          <div className="crop-rec-emoji" style={{background:cr.c+"18"}}>{cr.e}</div>
+          <div className="crop-rec-info">
+            <div className="crop-rec-name">{cr.n}</div>
+            <div className="crop-rec-meta">📅 {cr.s} பருவம்</div>
+            <div className="crop-bar"><div className="crop-bar-fill" style={{width:`${cr.pct}%`,background:cr.c}}/></div>
+          </div>
+          <div className="crop-rec-score" style={{color:cr.c}}>{cr.pct}%</div>
+        </div>
+      ))}
+
+      {/* ADVISORY */}
+      <div className="advisory">
+        <div className="advisory-icon">💡</div>
+        <div>
+          <div className="advisory-title">இன்றைய அறிவுரை | Today's Advisory</div>
+          <div className="advisory-text">
+            மண் ஈரம் போதுமானது. 2 நாட்கள் நீர்ப்பாசனம் தள்ளிப் போடுங்கள்.
+            {wx ? ` தற்போது ${wx.current.condition.text}, ${Math.round(wx.current.temp_c)}°C.` : ""}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══ SOIL ═══ */
+function Soil() {
+  const [s, setS] = useState({ ph:"6.5", n:"240", p:"18", k:"200", moisture:"42", type:"Loamy" });
+  const [res, setRes] = useState(null);
+  const [load, setLoad] = useState(false);
+
+  const run = async () => {
+    setLoad(true);
+    const raw = await gemini(`Agricultural AI. Soil: pH:${s.ph}, N:${s.n}kg/ha, P:${s.p}kg/ha, K:${s.k}kg/ha, moisture:${s.moisture}%, type:${s.type}. ONLY valid JSON: {"soilHealth":"Good","healthScore":78,"status":"Suitable for Kharif crops","insights":["i1","i2","i3"],"amendments":["a1","a2"],"suitableCrops":["Paddy","Groundnut","Maize"],"warnings":["w1"]}`);
+    setRes(pj(raw, { soilHealth:"Good", healthScore:76, status:"Suitable for cultivation", insights:["pH is in optimal range (6–7.5) for most crops","Nitrogen levels adequate for vegetative growth","Potassium slightly low — supplement recommended"], amendments:["25 kg/acre potash fertilizer","5 tonnes/acre FYM before sowing"], suitableCrops:["Paddy","Groundnut","Maize","Ragi"], warnings:["Monitor moisture bi-weekly in dry periods"] }));
+    setLoad(false);
+  };
+
+  const sc = res ? (res.healthScore>70?"#1a6b3c":res.healthScore>50?"#c8620a":"#c0392b") : "#1a6b3c";
+  const sb = res ? (res.healthScore>70?"#e6f7ed":res.healthScore>50?"#fff8eb":"#fdf0ee") : "#e6f7ed";
+
+  return (
+    <div className="page">
+      <div className="section-title" style={{margin:"0 0 4px"}}>🪨 மண் பரிசோதனை | Soil Analysis</div>
+      <p style={{fontSize:14,color:"#7a9a7e",marginBottom:18,fontWeight:600}}>உங்கள் மண் விவரங்களை உள்ளிடுங்கள் | Enter your soil details</p>
+
+      <div className="card">
+        <div className="section-title" style={{fontSize:16,margin:"0 0 14px"}}>🧪 மண் அளவுகள் | Soil Parameters</div>
+        <div className="field-grid">
+          {[["ph","🌡️ மண் அமிலத்தன்மை | pH","6.0 – 7.5"],
+            ["n","🌿 நைட்ரஜன் | Nitrogen (kg/ha)","200 – 300"],
+            ["p","⚗️ பாஸ்பரஸ் | Phosphorus (kg/ha)","10 – 25"],
+            ["k","🔬 பொட்டாசியம் | Potassium (kg/ha)","150 – 250"],
+            ["moisture","💧 ஈரப்பதம் | Moisture %","30 – 60"]
+          ].map(([k,l,ph]) => (
+            <div key={k} className="field">
+              <div className="field-label">{l}</div>
+              <input className="field-input" value={s[k]} placeholder={ph} onChange={e=>setS({...s,[k]:e.target.value})}/>
+            </div>
+          ))}
+          <div className="field">
+            <div className="field-label">🪨 மண் வகை | Soil Type</div>
+            <select className="field-input" value={s.type} onChange={e=>setS({...s,type:e.target.value})}>
+              {["Loamy","Sandy","Clay","Silty","Black Cotton","Red Laterite","Alluvial"].map(t=><option key={t}>{t}</option>)}
+            </select>
+          </div>
+        </div>
+        <button className="btn-big" onClick={run} disabled={load}>
+          {load ? <><div className="spin"/><span>பரிசோதிக்கிறது… Analyzing…</span></> : <><span>🔬</span><span>மண் பரிசோதனை | Analyze Soil</span></>}
+        </button>
+      </div>
+
+      {res && (<>
+        <div className="card" style={{border:`3px solid ${sc}`}}>
+          <div style={{display:"flex",gap:16,alignItems:"center"}}>
+            <div className="health-ring" style={{borderColor:sc,background:sb,color:sc}}>
+              <div className="health-ring-n">{res.healthScore}</div>
+              <div className="health-ring-l">/100</div>
+            </div>
+            <div>
+              <div style={{fontSize:12,color:"#7a9a7e",fontWeight:700,textTransform:"uppercase",letterSpacing:0.8}}>மண் ஆரோக்கியம் | Soil Health</div>
+              <div style={{fontFamily:"'Nunito',sans-serif",fontSize:28,fontWeight:900,color:sc,marginTop:2}}>{res.soilHealth}</div>
+              <div style={{fontSize:14,color:"#4a6b4f",marginTop:4,fontWeight:600}}>{res.status}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>💡 AI அறிவுரை | Insights</div>
+          {res.insights.map((ins,i) => (
+            <div key={i} className="list-row"><div className="list-bullet"/><span>{ins}</span></div>
+          ))}
+        </div>
+
+        {res.warnings?.filter(Boolean).length > 0 && (
+          <div className="advisory">
+            <div className="advisory-icon">⚠️</div>
+            <div><div className="advisory-title">எச்சரிக்கை | Warning</div><div className="advisory-text">{res.warnings.join(" · ")}</div></div>
+          </div>
+        )}
+
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>🌿 சேர்க்க வேண்டியவை | Amendments</div>
+          {res.amendments.map((a,i) => (
+            <div key={i} style={{background:i%2===0?"#e6f7ed":"#f5f7f5",borderRadius:12,padding:"12px 14px",marginBottom:8,display:"flex",gap:10,alignItems:"center",fontFamily:"'Nunito',sans-serif",fontSize:14,fontWeight:700,color:"#1a2e1e"}}>
+              <span style={{fontSize:20}}>🧪</span>{a}
+            </div>
+          ))}
+        </div>
+
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>🌾 ஏற்ற பயிர்கள் | Suitable Crops</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {res.suitableCrops.map(c => (
+              <div key={c} style={{background:c==="Paddy"||c==="Rice"?"#e6f7ed":"#fff8eb",border:"2px solid",borderColor:c==="Paddy"||c==="Rice"?"#a8ddb8":"#ffd480",borderRadius:30,padding:"8px 18px",fontFamily:"'Nunito',sans-serif",fontSize:15,fontWeight:800,color:"#1a2e1e",display:"flex",alignItems:"center",gap:6}}>
+                {CROP_EMOJI_MAP[c]||CROP_EMOJI_MAP[`${c}`]||"🌱"} {c}
+              </div>
+            ))}
+          </div>
+        </div>
+      </>)}
+    </div>
+  );
+}
+
+/* ═══ CROPS ═══ */
+function CropsPage() {
+  const [view, setView] = useState("portfolio");
+  const [f, setF] = useState({ season:"Kharif", region:"Tamil Nadu", land:"3", budget:"50000" });
+  const [res, setRes] = useState(null);
+  const [load, setLoad] = useState(false);
+  const [search, setSearch] = useState("");
+  const [cat, setCat] = useState("All");
+  const [selected, setSelected] = useState(null);
+  const [cropInfo, setCropInfo] = useState(null);
+  const [cropLoad, setCropLoad] = useState(false);
+
+  const COLORS = ["#1e7a3e","#c8620a","#2980b9","#b8860b","#7b3f9e"];
+  const RISK = { Low:{bg:"#e6f7ed",c:"#1a6b3c"}, Medium:{bg:"#fff8eb",c:"#c8620a"}, High:{bg:"#fdf0ee",c:"#c0392b"} };
+  const cats = ["All", ...Object.keys(CROPS)];
+
+  const filtered = () => {
+    let list = cat === "All"
+      ? Object.entries(CROPS).flatMap(([catName, items]) => items.map(i => ({...i,cat:catName})))
+      : (CROPS[cat]||[]).map(i => ({...i,cat}));
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(c => c.n.toLowerCase().includes(q) || c.r.toLowerCase().includes(q));
+    }
+    return list;
+  };
+
+  const run = async () => {
+    setLoad(true);
+    const raw = await gemini(`Expert Indian crop advisor. Season:${f.season}, Region:${f.region}, Land:${f.land}acres, Budget:₹${f.budget}. Pick the 3 most suitable crops. ONLY valid JSON: {"portfolio":[{"crop":"Paddy","allocation":60,"yield":"45 q/acre","roi":"175%","risk":"Low","season":"Jun-Oct","investment":"18000","profit":"31500"},{"crop":"Groundnut","allocation":30,"yield":"12 q/acre","roi":"140%","risk":"Medium","season":"Jun-Sep","investment":"12000","profit":"16800"},{"crop":"Maize","allocation":10,"yield":"28 q/acre","roi":"120%","risk":"Low","season":"Jun-Sep","investment":"8000","profit":"9600"}],"strategy":"Strategy in 1 sentence","totalInvestment":"38000","expectedProfit":"85000","tips":["tip1","tip2","tip3"]}`);
+    setRes(pj(raw, { portfolio:[{crop:"Paddy",allocation:60,yield:"45 q/acre",roi:"175%",risk:"Low",season:"Jun-Oct",investment:"18000",profit:"31500"},{crop:"Groundnut",allocation:30,yield:"12 q/acre",roi:"140%",risk:"Medium",season:"Jun-Sep",investment:"12000",profit:"16800"},{crop:"Maize",allocation:10,yield:"28 q/acre",roi:"120%",risk:"Low",season:"Jun-Sep",investment:"8000",profit:"9600"}], strategy:"Diversified Kharif portfolio for Tamil Nadu conditions.", totalInvestment:"38000", expectedProfit:"85000", tips:["Sow paddy after first monsoon rain","Use certified groundnut seeds","Apply fertilizer in split doses"] }));
+    setLoad(false);
+  };
+
+  const openCrop = async (crop) => {
+    setSelected(crop); setCropInfo(null); setCropLoad(true);
+    const raw = await gemini(`Farming info for ${crop.n} in India. ONLY valid JSON: {"description":"2-sentence overview","season":"${crop.s}","waterNeeds":"Moderate","soilType":"Loamy","fertilizerNPK":"120:60:40","avgYield":"45 q/acre","growthDays":"120-150 days","diseases":["d1","d2"],"marketPrice":"₹1800-2200/quintal","profitability":"High"}`);
+    setCropInfo(pj(raw, { description:`${crop.n.split("|").pop().trim()} is a major Indian crop grown widely.`, season:crop.s, waterNeeds:"Moderate", soilType:"Loamy", fertilizerNPK:"As recommended", avgYield:"Varies", growthDays:"90-180 days", diseases:["Leaf blight","Root rot"], marketPrice:"Market dependent", profitability:"Medium" }));
+    setCropLoad(false);
+  };
+
+  return (
+    <div className="page">
+      <div className="section-title" style={{margin:"0 0 4px"}}>🌱 பயிர்கள் | Crops</div>
+      <p style={{fontSize:14,color:"#7a9a7e",marginBottom:16,fontWeight:600}}>AI திட்டம் · {ALL_CROP_LIST.length}+ பயிர்கள் | AI Portfolio · Browse {ALL_CROP_LIST.length}+ crops</p>
+
+      <div className="toggle-bar">
+        {[["portfolio","🤖 AI திட்டம்\nAI Portfolio"],["browse","🌾 அனைத்து பயிர்கள்\nAll Crops"]].map(([v,l])=>(
+          <div key={v} className={`toggle-opt${view===v?" active":""}`} onClick={()=>setView(v)} style={{whiteSpace:"pre-line",lineHeight:1.3,fontSize:13}}>
+            {l}
+          </div>
+        ))}
+      </div>
+
+      {/* CROP DETAIL SHEET */}
+      {selected && (
+        <div className="detail-overlay" onClick={()=>setSelected(null)}>
+          <div className="detail-sheet" onClick={e=>e.stopPropagation()}>
+            <div className="detail-sheet-handle"/>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+              <div style={{display:"flex",gap:14,alignItems:"center"}}>
+                <div style={{fontSize:44}}>{selected.e}</div>
+                <div>
+                  <div style={{fontFamily:"'Nunito',sans-serif",fontSize:20,fontWeight:900,color:"#1a2e1e",lineHeight:1.2}}>{selected.n.split("|")[0].trim()}</div>
+                  {selected.n.includes("|") && <div style={{fontFamily:"'Nunito',sans-serif",fontSize:14,fontWeight:700,color:"#7a9a7e",marginTop:2}}>{selected.n.split("|")[1].trim()}</div>}
+                </div>
+              </div>
+              <div onClick={()=>setSelected(null)} style={{width:38,height:38,borderRadius:"50%",background:"#f5f7f5",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:18,fontWeight:700,color:"#4a6b4f"}}>✕</div>
+            </div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
+              <span style={{background:"#e6f7ed",color:"#1a6b3c",borderRadius:30,padding:"6px 14px",fontSize:13,fontWeight:800}}>📅 {selected.s}</span>
+              <span style={{background:"#ebf5fb",color:"#2980b9",borderRadius:30,padding:"6px 14px",fontSize:13,fontWeight:800}}>📍 {selected.r}</span>
+              <span style={{background:"#f5f7f5",color:"#4a6b4f",borderRadius:30,padding:"6px 14px",fontSize:13,fontWeight:800}}>📂 {selected.cat?.split("|")[1]?.trim()||selected.cat}</span>
+            </div>
+            {cropLoad && <div style={{display:"flex",flexDirection:"column",gap:10}}>{[1,2,3,4].map(i=><div key={i} className="skel" style={{height:16,width:`${60+i*8}%`}}/>)}</div>}
+            {cropInfo && (<>
+              <div style={{fontSize:15,color:"#1a2e1e",lineHeight:1.7,marginBottom:18,fontWeight:500}}>{cropInfo.description}</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+                {[["💧 Water",cropInfo.waterNeeds],["🪨 Soil",cropInfo.soilType],["⚗️ NPK",cropInfo.fertilizerNPK],["📦 Yield",cropInfo.avgYield],["📅 Duration",cropInfo.growthDays],["💰 Price",cropInfo.marketPrice]].map(([l,v])=>(
+                  <div key={l} style={{background:"#f5f7f5",borderRadius:14,padding:"12px 14px"}}>
+                    <div style={{fontSize:11,color:"#7a9a7e",fontWeight:700,textTransform:"uppercase",letterSpacing:0.6,marginBottom:4}}>{l}</div>
+                    <div style={{fontFamily:"'Nunito',sans-serif",fontSize:15,fontWeight:800,color:"#1a2e1e"}}>{v||"—"}</div>
+                  </div>
+                ))}
+              </div>
+              {cropInfo.diseases?.length>0&&(
+                <div style={{marginBottom:14}}>
+                  <div style={{fontFamily:"'Nunito',sans-serif",fontSize:14,fontWeight:800,color:"#1a2e1e",marginBottom:8}}>⚠️ பொதுவான நோய்கள் | Common Diseases</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{cropInfo.diseases.map(d=><span key={d} style={{background:"#fdf0ee",color:"#c0392b",borderRadius:30,padding:"5px 14px",fontSize:13,fontWeight:800}}>🦠 {d}</span>)}</div>
+                </div>
+              )}
+              <div style={{background:"#e6f7ed",borderRadius:14,padding:"12px 16px",fontFamily:"'Nunito',sans-serif",fontSize:15,fontWeight:800,color:"#1a6b3c",display:"flex",alignItems:"center",gap:8}}>
+                📈 லாப நிலை | Profitability: {cropInfo.profitability}
+              </div>
+            </>)}
+          </div>
+        </div>
+      )}
+
+      {/* PORTFOLIO VIEW */}
+      {view === "portfolio" && (<>
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 14px"}}>🚜 பண்ணை விவரம் | Farm Details</div>
+          <div className="field-grid">
+            <div className="field">
+              <div className="field-label">📅 பருவம் | Season</div>
+              <select className="field-input" value={f.season} onChange={e=>setF({...f,season:e.target.value})}>
+                {["Kharif","Rabi","Zaid","Perennial"].map(s=><option key={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="field">
+              <div className="field-label">📍 மாநிலம் | State</div>
+              <select className="field-input" value={f.region} onChange={e=>setF({...f,region:e.target.value})}>
+                {["Tamil Nadu","Punjab","Maharashtra","Karnataka","Andhra Pradesh","Uttar Pradesh","Gujarat","Rajasthan","Madhya Pradesh","Bihar","West Bengal","Odisha","Kerala","Assam","Telangana","Haryana"].map(r=><option key={r}>{r}</option>)}
+              </select>
+            </div>
+            <div className="field">
+              <div className="field-label">🌾 நிலம் | Land (acres)</div>
+              <input className="field-input" value={f.land} type="number" onChange={e=>setF({...f,land:e.target.value})}/>
+            </div>
+            <div className="field">
+              <div className="field-label">💵 பட்ஜெட் | Budget (₹)</div>
+              <input className="field-input" value={f.budget} type="number" onChange={e=>setF({...f,budget:e.target.value})}/>
+            </div>
+          </div>
+          <button className="btn-big" onClick={run} disabled={load}>
+            {load?<><div className="spin"/><span>திட்டம் உருவாக்குகிறது…</span></>:<><span>🤖</span><span>AI திட்டம் உருவாக்கு | Generate Strategy</span></>}
+          </button>
+        </div>
+
+        {res && (<>
+          <div className="card-green">
+            <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",fontWeight:700,letterSpacing:1,textTransform:"uppercase",marginBottom:8}}>📋 PORTFOLIO STRATEGY</div>
+            <div style={{fontSize:15,color:"rgba(255,255,255,0.85)",lineHeight:1.6,marginBottom:16}}>{res.strategy}</div>
+            <div className="alloc-bar">
+              {res.portfolio.map((c,i)=><div key={c.crop} className="alloc-seg" style={{width:`${c.allocation}%`,background:COLORS[i%5]}}/>)}
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
+              {res.portfolio.map((c,i)=>(
+                <div key={c.crop} style={{display:"flex",alignItems:"center",gap:5,fontSize:12,color:"rgba(255,255,255,0.7)",fontWeight:700}}>
+                  <div style={{width:10,height:10,borderRadius:3,background:COLORS[i%5]}}/>
+                  {c.crop} {c.allocation}%
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:12}}>
+              {[["முதலீடு\nInvestment",`₹${parseInt(res.totalInvestment).toLocaleString()}`,"rgba(255,255,255,0.12)","#fff"],
+                ["எதிர்பார்க்கும் லாபம்\nExpected Profit",`₹${parseInt(res.expectedProfit).toLocaleString()}`,"rgba(245,166,35,0.2)","#ffe066"]
+              ].map(([l,v,bg,vc])=>(
+                <div key={l} style={{flex:1,background:bg,border:"1px solid rgba(255,255,255,0.12)",borderRadius:14,padding:"12px 10px",textAlign:"center"}}>
+                  <div style={{fontSize:10,color:"rgba(255,255,255,0.5)",fontWeight:700,whiteSpace:"pre-line",lineHeight:1.3,marginBottom:6}}>{l}</div>
+                  <div style={{fontFamily:"'Nunito',sans-serif",fontSize:22,fontWeight:900,color:vc}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {res.portfolio.map((c,i)=>{
+            const rs = RISK[c.risk]||RISK.Low;
+            const em = CROP_EMOJI_MAP[c.crop] || CROP_EMOJI_MAP[`நெல் | ${c.crop}`] || "🌱";
+            return (
+              <div key={c.crop} className="portfolio-card">
+                <div className="portfolio-card-head">
+                  <div className="portfolio-crop-name">
+                    <span style={{fontSize:30}}>{em}</span>{c.crop}
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div className="portfolio-alloc" style={{color:COLORS[i%5]}}>{c.allocation}%</div>
+                    <div className="risk-tag" style={{background:rs.bg,color:rs.c,marginTop:4}}>{c.risk} Risk</div>
+                  </div>
+                </div>
+                <div style={{fontSize:13,color:"#7a9a7e",marginBottom:12,fontWeight:600}}>📅 {c.season}</div>
+                <div className="crop-metrics">
+                  <div className="crop-metric"><div className="crop-metric-val">{c.yield}</div><div className="crop-metric-lbl">விளைச்சல்\nYield</div></div>
+                  <div className="crop-metric"><div className="crop-metric-val" style={{color:"#1a6b3c"}}>{c.roi}</div><div className="crop-metric-lbl">வருவாய்\nROI</div></div>
+                  <div className="crop-metric"><div className="crop-metric-val" style={{color:"#c8620a"}}>₹{parseInt(c.investment||0).toLocaleString()}</div><div className="crop-metric-lbl">செலவு\nCost</div></div>
+                </div>
+              </div>
+            );
+          })}
+
+          <div className="card">
+            <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>💡 நிபுணர் ஆலோசனை | Tips</div>
+            {res.tips.map((t,i)=>(
+              <div key={i} className="list-row"><div className="list-bullet"/><span>{t}</span></div>
+            ))}
+          </div>
+        </>)}
+      </>)}
+
+      {/* BROWSE VIEW */}
+      {view === "browse" && (<>
+        <div className="search-wrap">
+          <div className="search-ico">🔍</div>
+          <input className="search-input" placeholder={`${ALL_CROP_LIST.length}+ பயிர்களை தேடுங்கள் | Search crops…`} value={search} onChange={e=>setSearch(e.target.value)}/>
+        </div>
+        <div className="cat-strip">
+          {cats.map(c=>(
+            <div key={c} className={`cat-chip${cat===c?" active":""}`} onClick={()=>setCat(c)}>
+              {c==="All"?`அனைத்தும் (${ALL_CROP_LIST.length})`:c.split("|")[1]?.trim()||c}
+            </div>
+          ))}
+        </div>
+        <div style={{fontSize:13,color:"#7a9a7e",marginBottom:12,fontWeight:700}}>
+          {filtered().length} பயிர்கள் | crops {search?`"${search}"`:""}
+        </div>
+        <div className="crop-grid">
+          {filtered().map((crop,i)=>(
+            <div key={`${crop.n}-${i}`} className="crop-tile" onClick={()=>openCrop(crop)}>
+              <div className="crop-tile-emoji">{crop.e}</div>
+              <div className="crop-tile-name">{crop.n}</div>
+              <div className="crop-tile-season">📅 {crop.s}</div>
+              <div className="crop-tile-region">📍 {crop.r.split(",")[0].trim()}</div>
+            </div>
+          ))}
+        </div>
+        {filtered().length===0&&(
+          <div className="empty">
+            <div className="empty-icon">🔍</div>
+            <div className="empty-title">பயிர் கிடைக்கவில்லை</div>
+            <div className="empty-sub">No crops found — try another word</div>
+          </div>
+        )}
+      </>)}
+    </div>
+  );
+}
+
+/* ═══ SCAN ═══ */
+function Scan() {
+  const [img, setImg] = useState(null);
+  const [b64, setB64] = useState(null);
+  const [pn, setPn] = useState(null);
+  const [res, setRes] = useState(null);
+  const [load, setLoad] = useState(false);
+  const fileRef = useRef();
+
+  const pick = e => {
+    const f = e.target.files[0]; if (!f) return;
+    setImg(URL.createObjectURL(f)); setRes(null); setPn(null);
+    const r = new FileReader();
+    r.onload = ev => setB64(ev.target.result.split(",")[1]);
+    r.readAsDataURL(f);
+  };
+
+  const run = async () => {
+    if (!b64) return; setLoad(true);
+    try {
+      const fd = new FormData();
+      const blob = await (await fetch(`data:image/jpeg;base64,${b64}`)).blob();
+      fd.append("images", blob, "plant.jpg"); fd.append("organs", "leaf");
+      const r = await fetch(`https://my-api.plantnet.org/v2/identify/all?api-key=${KEYS.plantnet}&lang=en`, {method:"POST",body:fd});
+      if (r.ok) { const d = await r.json(); if (d.results?.[0]) setPn(d.results[0]); }
+    } catch {}
+    const raw = await gemini(`Expert plant pathologist. Analyze this plant image. ONLY valid JSON: {"issue":"Disease name","isHealthy":false,"severity":"Mild","confidence":85,"cause":"Cause","category":"Disease","symptoms":["s1","s2","s3"],"fertilizers":["f1","f2"],"treatment":["step1","step2","step3"],"recoveryDays":"7-14 days","preventive":["p1"]}`, b64);
+    setRes(pj(raw, { issue:"Leaf Blight", isHealthy:false, severity:"Moderate", confidence:81, cause:"Fungal infection (Helminthosporium) from high humidity.", category:"Disease", symptoms:["Brown oval spots on leaves","Yellow border around spots","Leaves falling early"], fertilizers:["NPK 19:19:19","Zinc Sulphate"], treatment:["Remove infected leaves and burn","Spray Mancozeb @ 2g/litre water","Apply Carbendazim after 7 days","Improve drainage"], recoveryDays:"10–14 days", preventive:["Use resistant seed varieties"] }));
+    setLoad(false);
+  };
+
+  const SEV = {Mild:{bg:"#e6f7ed",br:"#2d9659",c:"#1a6b3c"},Moderate:{bg:"#fff8eb",br:"#f5a623",c:"#c8620a"},Severe:{bg:"#fdf0ee",br:"#e74c3c",c:"#c0392b"}};
+  const sv = res ? (SEV[res.severity]||SEV.Moderate) : SEV.Moderate;
+
+  return (
+    <div className="page">
+      <div className="section-title" style={{margin:"0 0 4px"}}>📷 தாவர பரிசோதனை | Plant Scan</div>
+      <p style={{fontSize:14,color:"#7a9a7e",marginBottom:18,fontWeight:600}}>படம் எடுத்து நோய் கண்டறியுங்கள் | Take photo to detect disease</p>
+
+      <div className="card">
+        <div className="scan-zone" onClick={()=>fileRef.current.click()}>
+          {img
+            ? <img src={img} alt="plant" style={{width:"100%",borderRadius:16,maxHeight:240,objectFit:"cover"}}/>
+            : <>
+              <div className="scan-zone-icon">📸</div>
+              <div className="scan-zone-title">தாவர படம் எடுங்கள்<br/>Upload Plant Photo</div>
+              <div className="scan-zone-sub">இலை · தண்டு · காய் | Leaf · Stem · Fruit</div>
+            </>
+          }
+        </div>
+        <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={pick}/>
+        {img && (<>
+          <button className="btn-big" onClick={run} disabled={load} style={{marginTop:14}}>
+            {load?<><div className="spin"/><span>பரிசோதிக்கிறது… Scanning…</span></>:<><span>🔬</span><span>நோய் கண்டறி | Diagnose</span></>}
+          </button>
+          <button className="btn-outline" onClick={()=>{setImg(null);setRes(null);setPn(null);}}>📷 வேறு படம் | Change Photo</button>
+        </>)}
+      </div>
+
+      {pn && (
+        <div className="card" style={{background:"#ebf5fb",border:"2.5px solid #90caf9"}}>
+          <div className="section-title" style={{fontSize:16,margin:"0 0 8px",color:"#2980b9"}}>🌿 தாவர அடையாளம் | Plant ID</div>
+          <div style={{fontFamily:"'Nunito',sans-serif",fontSize:18,fontWeight:900,color:"#1a2e1e"}}>{pn.species?.commonNames?.[0]||pn.species?.scientificNameWithoutAuthor||"Unknown"}</div>
+          <div style={{fontSize:13,color:"#7a9a7e",fontStyle:"italic",marginTop:4,fontWeight:600}}>{pn.species?.scientificNameWithoutAuthor}</div>
+          <div style={{marginTop:8}}>
+            <span style={{background:"#fff",border:"2px solid #90caf9",borderRadius:30,padding:"5px 14px",fontFamily:"'Nunito',sans-serif",fontSize:13,fontWeight:800,color:"#2980b9"}}>{Math.round((pn.score||0)*100)}% match</span>
+          </div>
+        </div>
+      )}
+
+      {res && (<>
+        <div className="result-block" style={{background:sv.bg,borderColor:sv.br}}>
+          <div style={{fontSize:12,color:sv.c,fontWeight:800,textTransform:"uppercase",letterSpacing:0.8,marginBottom:6}}>
+            {res.category==="Disease"?"🦠":res.category==="Pest"?"🐛":res.category==="Deficiency"?"⚗️":"✅"} {res.category} கண்டறியப்பட்டது | Detected
+          </div>
+          <div className="result-heading" style={{color:sv.c}}>{res.issue}</div>
+          <div className="badge-row">
+            <div className="badge" style={{background:sv.br+"22",color:sv.c}}>{res.severity} Severity</div>
+            <div className="badge" style={{background:"#ebf5fb",color:"#2980b9"}}>{res.confidence}% Confidence</div>
+          </div>
+          <div style={{marginTop:12,fontSize:15,color:"#1a2e1e",lineHeight:1.7,fontWeight:500}}>
+            <strong>காரணம் | Cause: </strong>{res.cause}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>🔍 அறிகுறிகள் | Symptoms</div>
+          {res.symptoms?.map((s,i) => (
+            <div key={i} className="list-row"><div className="list-bullet" style={{background:"#f5a623"}}/><span>{s}</span></div>
+          ))}
+        </div>
+
+        {!res.isHealthy && (<>
+          <div className="card">
+            <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>🧪 உரங்கள் | Fertilizers / Inputs</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+              {res.fertilizers?.map(f => (
+                <div key={f} style={{background:"#e6f7ed",border:"2px solid #a8ddb8",borderRadius:30,padding:"8px 18px",fontFamily:"'Nunito',sans-serif",fontSize:15,fontWeight:800,color:"#1a6b3c",display:"flex",alignItems:"center",gap:6}}>
+                  🌿 {f}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>💊 சிகிச்சை | Treatment Steps</div>
+            {res.treatment?.map((t,i) => (
+              <div key={i} className="step-row">
+                <div className="step-num">{i+1}</div>
+                <div className="step-text">{t}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+            <div style={{background:"#1e7a3e",borderRadius:20,padding:18,textAlign:"center",color:"#fff"}}>
+              <div style={{fontSize:11,opacity:0.6,textTransform:"uppercase",letterSpacing:0.8,marginBottom:8,fontWeight:700}}>குணமாகும் நேரம்\nRecovery Time</div>
+              <div style={{fontFamily:"'Nunito',sans-serif",fontSize:20,fontWeight:900}}>{res.recoveryDays}</div>
+            </div>
+            <div style={{background:"#1a2e1e",borderRadius:20,padding:18,textAlign:"center",color:"#fff"}}>
+              <div style={{fontSize:11,opacity:0.6,textTransform:"uppercase",letterSpacing:0.8,marginBottom:8,fontWeight:700}}>தடுப்பு\nPrevention</div>
+              <div style={{fontSize:13,lineHeight:1.5,fontWeight:600,color:"rgba(255,255,255,0.8)"}}>{res.preventive?.[0]||"Use resistant varieties"}</div>
+            </div>
+          </div>
+        </>)}
+      </>)}
+    </div>
+  );
+}
+
+/* ═══ MARKET ═══ */
+function Market() {
+  const [f, setF] = useState({ crop:"நெல் | Paddy", state:"Tamil Nadu" });
+  const [res, setRes] = useState(null);
+  const [load, setLoad] = useState(false);
+
+  const run = async () => {
+    setLoad(true);
+    const cropName = f.crop.includes("|") ? f.crop.split("|")[1].trim() : f.crop;
+    const raw = await gemini(`Indian agricultural market for ${cropName} in ${f.state}. ONLY valid JSON: {"currentPrice":2150,"unit":"per quintal","msp":2018,"trend":"Rising","change7d":"+3.8%","change30d":"+7.2%","volatility":"Low","forecast30d":2240,"forecast60d":2310,"mandis":[{"name":"Chennai Koyambedu","price":2150,"trend":"↑","volume":"1200 MT"},{"name":"Coimbatore APMC","price":2090,"trend":"→","volume":"800 MT"},{"name":"Madurai","price":2200,"trend":"↑","volume":"600 MT"}],"factors":["f1","f2","f3"],"advice":"Selling advice in 1 sentence","sellRating":"Good"}`);
+    setRes(pj(raw, { currentPrice:2150,unit:"per quintal",msp:2018,trend:"Rising",change7d:"+3.8%",change30d:"+7.2%",volatility:"Low",forecast30d:2240,forecast60d:2310, mandis:[{name:"Chennai Koyambedu",price:2150,trend:"↑",volume:"1200 MT"},{name:"Coimbatore APMC",price:2090,trend:"→",volume:"800 MT"},{name:"Madurai",price:2200,trend:"↑",volume:"600 MT"}], factors:["Strong export demand","Below-average FCI procurement","Monsoon deficit in competing states"], advice:"Good time to sell — prices expected to stay firm for 30 days.", sellRating:"Good" }));
+    setLoad(false);
+  };
+
+  const TC = { Rising:{c:"#1a6b3c",bg:"#e6f7ed",icon:"📈"}, Falling:{c:"#c0392b",bg:"#fdf0ee",icon:"📉"}, Stable:{c:"#c8620a",bg:"#fff8eb",icon:"📊"} };
+  const ts = res ? (TC[res.trend]||TC.Stable) : TC.Stable;
+
+  return (
+    <div className="page">
+      <div className="section-title" style={{margin:"0 0 4px"}}>📊 சந்தை விலை | Market Price</div>
+      <p style={{fontSize:14,color:"#7a9a7e",marginBottom:18,fontWeight:600}}>மண்டி விலை · AI முன்னறிவிப்பு | Mandi rates · AI Forecast</p>
+
+      <div className="card">
+        <div className="section-title" style={{fontSize:16,margin:"0 0 14px"}}>🌾 பயிர் தேர்வு | Select Crop</div>
+        <div className="field">
+          <div className="field-label">🌱 பயிர் | Crop</div>
+          <select className="field-input" value={f.crop} onChange={e=>setF({...f,crop:e.target.value})}>
+            {ALL_CROP_NAMES.map(c=><option key={c}>{c}</option>)}
+          </select>
+        </div>
+        <div className="field">
+          <div className="field-label">📍 மாநிலம் | State</div>
+          <select className="field-input" value={f.state} onChange={e=>setF({...f,state:e.target.value})}>
+            {["Tamil Nadu","Punjab","Maharashtra","Karnataka","Andhra Pradesh","Uttar Pradesh","Gujarat","Rajasthan","Madhya Pradesh","Bihar","West Bengal","Odisha","Kerala","Assam","Telangana","Haryana"].map(s=><option key={s}>{s}</option>)}
+          </select>
+        </div>
+        <button className="btn-big" onClick={run} disabled={load}>
+          {load?<><div className="spin"/><span>விலை பெறுகிறது…</span></>:<><span>📈</span><span>சந்தை விலை பெறு | Get Price</span></>}
+        </button>
+      </div>
+
+      {res && (<>
+        <div className="price-hero">
+          <div style={{fontSize:11,color:"rgba(255,255,255,0.45)",letterSpacing:1.2,textTransform:"uppercase",marginBottom:8,fontWeight:700}}>
+            💹 {f.crop.split("|")[0].trim()} · {f.state}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end"}}>
+            <div>
+              <div className="price-big">₹{res.currentPrice?.toLocaleString()}</div>
+              <div className="price-unit">{res.unit}</div>
+              <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginTop:4,fontWeight:600}}>MSP ₹{res.msp?.toLocaleString()} · {res.volatility} volatility</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div className="trend-chip" style={{background:ts.bg,color:ts.c}}>{ts.icon} {res.trend}</div>
+              <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",marginTop:6,fontWeight:600}}>7d {res.change7d} · 30d {res.change30d}</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="fc-boxes">
+          {[{l:"30 நாள்\n30-Day",v:`₹${res.forecast30d?.toLocaleString()}`,chg:`+${Math.round(((res.forecast30d||res.currentPrice)-res.currentPrice)/res.currentPrice*100)}%`,bg:"#ebf5fb",c:"#2980b9"},
+            {l:"60 நாள்\n60-Day",v:`₹${res.forecast60d?.toLocaleString()}`,chg:`+${Math.round(((res.forecast60d||res.currentPrice)-res.currentPrice)/res.currentPrice*100)}%`,bg:"#e6f7ed",c:"#1a6b3c"},
+            {l:"MSP மேல்\nAbove MSP",v:`₹${((res.currentPrice||0)-(res.msp||0)).toLocaleString()}`,chg:"premium",bg:"#fff8eb",c:"#c8620a"}
+          ].map(b=>(
+            <div key={b.l} className="fc-box" style={{background:b.bg}}>
+              <div className="fc-box-lbl" style={{color:b.c,whiteSpace:"pre-line",lineHeight:1.2}}>{b.l}</div>
+              <div className="fc-box-val" style={{color:b.c}}>{b.v}</div>
+              <div className="fc-box-chg" style={{color:b.c}}>{b.chg}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>🏪 அருகில் உள்ள மண்டிகள் | Nearby Mandis</div>
+          {res.mandis?.map(m => (
+            <div key={m.name} className="mandi-row">
+              <div>
+                <div className="mandi-name">{m.name}</div>
+                <div className="mandi-vol">📦 {m.volume}</div>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div className="mandi-price" style={{color:m.trend==="↑"?"#1a6b3c":m.trend==="↓"?"#c0392b":"#c8620a"}}>₹{m.price?.toLocaleString()}</div>
+                <div className="mandi-arrow" style={{color:m.trend==="↑"?"#1a6b3c":m.trend==="↓"?"#c0392b":"#c8620a"}}>{m.trend}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="advisory">
+          <div className="advisory-icon">💡</div>
+          <div><div className="advisory-title">AI அறிவுரை | AI Advice</div><div className="advisory-text">{res.advice}</div></div>
+        </div>
+
+        <div className="card">
+          <div className="section-title" style={{fontSize:16,margin:"0 0 12px"}}>📰 விலை காரணங்கள் | Price Factors</div>
+          {res.factors?.map((fac,i) => (
+            <div key={i} className="list-row"><div className="list-bullet"/><span>{fac}</span></div>
+          ))}
+        </div>
+      </>)}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════
+   LANGUAGE CONFIG — 6 languages
+══════════════════════════════════════ */
+const LANG_CONFIG = {
+  ta: {
+    label:"தமிழ்", flag:"🇮🇳", bcp:"ta-IN",
+    greeting:["காலை வணக்கம் 🌅","மதிய வணக்கம் ☀️","மாலை வணக்கம் 🌙"],
+    farmAssistant:"AI பண்ணை உதவியாளர்",
+    tapSpeak:"தட்டி பேசுங்கள்",
+    listening:"கேட்கிறேன்...",
+    typeHere:"இங்கே தட்டச்சு செய்யுங்கள்...",
+    quickQ:["என் மண்ணுக்கு எந்த பயிர்?","இலை மஞ்சளாகிறது ஏன்?","நெல்லுக்கு என்ன உரம்?","இன்று அரிசி விலை என்ன?","தண்ணீர் எப்போது ஊற்றணும்?","பூச்சி தாக்குதல் எப்படி தடுப்பது?"],
+    welcome:"வணக்கம்! 🙏 நான் உங்கள் AgriSense உதவியாளர். பயிர், மண், நோய், விலை பற்றி கேளுங்கள்!",
+    voiceNotSupported:"உங்கள் உலாவியில் குரல் ஆதரவு இல்லை. தட்டச்சு செய்யுங்கள்.",
+    voiceError:"குரல் கேட்கப்படவில்லை. மீண்டும் முயற்சிக்கவும்.",
+    changeLang:"மொழி மாற்று",
+    selectLang:"மொழி தேர்வு செய்யுங்கள்",
+    geminiLang:"Tamil",
+  },
+  hi: {
+    label:"हिंदी", flag:"🇮🇳", bcp:"hi-IN",
+    greeting:["सुप्रभात 🌅","शुभ दोपहर ☀️","शुभ संध्या 🌙"],
+    farmAssistant:"AI किसान सहायक",
+    tapSpeak:"बोलने के लिए टैप करें",
+    listening:"सुन रहा हूँ...",
+    typeHere:"यहाँ लिखें...",
+    quickQ:["मेरी मिट्टी के लिए कौनसी फसल?","पत्ते पीले क्यों हो रहे हैं?","धान के लिए खाद कौनसी?","आज चावल का भाव?","सिंचाई कब करें?","कीटनाशक कैसे लगाएं?"],
+    welcome:"नमस्ते! 🙏 मैं आपका AgriSense सहायक हूँ। फसल, मिट्टी, बीमारी, भाव के बारे में पूछें!",
+    voiceNotSupported:"आपके ब्राउज़र में आवाज़ काम नहीं करती। टाइप करें।",
+    voiceError:"आवाज़ नहीं सुनी। फिर से कोशिश करें।",
+    changeLang:"भाषा बदलें",
+    selectLang:"भाषा चुनें",
+    geminiLang:"Hindi",
+  },
+  te: {
+    label:"తెలుగు", flag:"🇮🇳", bcp:"te-IN",
+    greeting:["శుభోదయం 🌅","శుభ మధ్యాహ్నం ☀️","శుభ సాయంత్రం 🌙"],
+    farmAssistant:"AI వ్యవసాయ సహాయకుడు",
+    tapSpeak:"మాట్లాడటానికి నొక్కండి",
+    listening:"వింటున్నాను...",
+    typeHere:"ఇక్కడ టైప్ చేయండి...",
+    quickQ:["నా మట్టికి ఏ పంట?","ఆకులు పసుపు ఎందుకు?","వరికి ఎరువు ఏది?","ఈరోజు వరి ధర?","నీరు ఎప్పుడు పెట్టాలి?","పురుగులను ఎలా నివారించాలి?"],
+    welcome:"నమస్కారం! 🙏 నేను మీ AgriSense సహాయకుడిని. పంట, మట్టి, వ్యాధి, ధర గురించి అడగండి!",
+    voiceNotSupported:"మీ బ్రౌజర్‌లో వాయిస్ పని చేయదు. టైప్ చేయండి.",
+    voiceError:"వాయిస్ వినలేదు. మళ్ళీ ప్రయత్నించండి.",
+    changeLang:"భాష మార్చు",
+    selectLang:"భాష ఎంచుకోండి",
+    geminiLang:"Telugu",
+  },
+  kn: {
+    label:"ಕನ್ನಡ", flag:"🇮🇳", bcp:"kn-IN",
+    greeting:["ಶುಭೋದಯ 🌅","ಶುಭ ಮಧ್ಯಾಹ್ನ ☀️","ಶುಭ ಸಂಜೆ 🌙"],
+    farmAssistant:"AI ಕೃಷಿ ಸಹಾಯಕ",
+    tapSpeak:"ಮಾತನಾಡಲು ಒತ್ತಿ",
+    listening:"ಕೇಳುತ್ತಿದ್ದೇನೆ...",
+    typeHere:"ಇಲ್ಲಿ ಟೈಪ್ ಮಾಡಿ...",
+    quickQ:["ನನ್ನ ಮಣ್ಣಿಗೆ ಯಾವ ಬೆಳೆ?","ಎಲೆಗಳು ಹಳದಿ ಯಾಕೆ?","ಭತ್ತಕ್ಕೆ ಯಾವ ಗೊಬ್ಬರ?","ಇಂದಿನ ಭತ್ತದ ಬೆಲೆ?","ನೀರು ಯಾವಾಗ ಹಾಕಬೇಕು?","ಕೀಟ ನಿಯಂತ್ರಣ ಹೇಗೆ?"],
+    welcome:"ನಮಸ್ಕಾರ! 🙏 ನಾನು ನಿಮ್ಮ AgriSense ಸಹಾಯಕ. ಬೆಳೆ, ಮಣ್ಣು, ರೋಗ, ಬೆಲೆ ಬಗ್ಗೆ ಕೇಳಿ!",
+    voiceNotSupported:"ನಿಮ್ಮ ಬ್ರೌಸರ್‌ನಲ್ಲಿ ಧ್ವನಿ ಕೆಲಸ ಮಾಡುವುದಿಲ್ಲ. ಟೈಪ್ ಮಾಡಿ.",
+    voiceError:"ಧ್ವನಿ ಕೇಳಿಲ್ಲ. ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.",
+    changeLang:"ಭಾಷೆ ಬದಲಿಸಿ",
+    selectLang:"ಭಾಷೆ ಆಯ್ಕೆ ಮಾಡಿ",
+    geminiLang:"Kannada",
+  },
+  ml: {
+    label:"മലയാളം", flag:"🇮🇳", bcp:"ml-IN",
+    greeting:["സുപ്രഭാതം 🌅","ഉച്ചയ്ക്ക് ആശംസകൾ ☀️","സന്ധ്യ ആശംസകൾ 🌙"],
+    farmAssistant:"AI കൃഷി സഹായി",
+    tapSpeak:"സംസാരിക്കാൻ ടാപ്പ് ചെയ്യുക",
+    listening:"കേൾക്കുന്നു...",
+    typeHere:"ഇവിടെ ടൈപ്പ് ചെയ്യുക...",
+    quickQ:["എന്റെ മണ്ണിന് ഏത് വിള?","ഇലകൾ മഞ്ഞ ആകുന്നത് എന്തുകൊണ്ട്?","നെൽകൃഷിക്ക് ഏത് വളം?","ഇന്ന് നെല്ലിന്റെ വില?","ജലസേചനം എപ്പോൾ?","കീടനിയന്ത്രണം എങ്ങനെ?"],
+    welcome:"നമസ്കാരം! 🙏 ഞാൻ നിങ്ങളുടെ AgriSense സഹായി. വിള, മണ്ണ്, രോഗം, വില എന്നിവ ചോദിക്കൂ!",
+    voiceNotSupported:"നിങ്ങളുടെ ബ്രൗസറിൽ വോയ്സ് പ്രവർത്തിക്കുന്നില്ല. ടൈപ്പ് ചെയ്യുക.",
+    voiceError:"ശബ്ദം കേൾക്കുന്നില്ല. വീണ്ടും ശ്രമിക്കൂ.",
+    changeLang:"ഭാഷ മാറ്റുക",
+    selectLang:"ഭാഷ തിരഞ്ഞെടുക്കുക",
+    geminiLang:"Malayalam",
+  },
+  en: {
+    label:"English", flag:"🇬🇧", bcp:"en-IN",
+    greeting:["Good Morning 🌅","Good Afternoon ☀️","Good Evening 🌙"],
+    farmAssistant:"AI Farm Assistant",
+    tapSpeak:"Tap & Speak",
+    listening:"Listening...",
+    typeHere:"Type your question here...",
+    quickQ:["Best crop for my soil?","Why leaves turning yellow?","Fertilizer for paddy?","Rice price today?","When to irrigate?","How to control pests?"],
+    welcome:"Hello! 🙏 I'm your AgriSense AI farming assistant. Ask about crops, soil, diseases, or prices!",
+    voiceNotSupported:"Voice not supported in this browser. Please type your question.",
+    voiceError:"Couldn't hear you. Please try again.",
+    changeLang:"Change Language",
+    selectLang:"Select Language",
+    geminiLang:"English",
+  },
+};
+
+const LANG_ORDER = ["ta","hi","te","kn","ml","en"];
+
+/* ══════════════════════════════════════
+   LANGUAGE SELECTOR MODAL
+══════════════════════════════════════ */
+function LangModal({ currentLang, onSelect, onClose }) {
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:300,display:"flex",alignItems:"flex-end"}} onClick={onClose}>
+      <div style={{background:"#fff",borderRadius:"28px 28px 0 0",padding:"24px 20px 36px",width:"100%",maxWidth:430,margin:"0 auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{width:40,height:4,background:"#d4e8d8",borderRadius:4,margin:"0 auto 20px"}}/>
+        <div style={{fontFamily:"'Nunito',sans-serif",fontSize:20,fontWeight:900,color:"#1a2e1e",marginBottom:6,textAlign:"center"}}>🌐 மொழி தேர்வு</div>
+        <div style={{fontSize:14,color:"#7a9a7e",textAlign:"center",marginBottom:20,fontWeight:600}}>Select your language / अपनी भाषा चुनें</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {LANG_ORDER.map(code => {
+            const l = LANG_CONFIG[code];
+            const active = currentLang === code;
+            return (
+              <div key={code} onClick={()=>onSelect(code)} style={{
+                background: active ? "#1e7a3e" : "#f5f7f5",
+                border: `3px solid ${active ? "#1e7a3e" : "#d4e8d8"}`,
+                borderRadius:16,padding:"16px 14px",cursor:"pointer",
+                display:"flex",alignItems:"center",gap:10,
+                transition:"all 0.15s",
+              }}>
+                <div style={{fontSize:28}}>{l.flag}</div>
+                <div>
+                  <div style={{fontFamily:"'Nunito',sans-serif",fontSize:18,fontWeight:900,color:active?"#fff":"#1a2e1e"}}>{l.label}</div>
+                  {active && <div style={{fontSize:11,color:"rgba(255,255,255,0.7)",fontWeight:700,marginTop:2}}>✓ Selected</div>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════
+   VOICE / CHAT MODULE
+══════════════════════════════════════ */
+function Voice({ lang, onChangeLang }) {
+  const L = LANG_CONFIG[lang];
+  const [listening, setListening] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("idle"); // idle | starting | listening | error
+  const [inp, setInp] = useState("");
+  const [chat, setChat] = useState([{ role:"ai", text: L.welcome }]);
+  const [load, setLoad] = useState(false);
+  const chatRef = useRef();
+  const recognitionRef = useRef(null);
+  const silenceTimer = useRef(null);
+
+  // Reset welcome message when language changes
+  useEffect(() => {
+    setChat([{ role:"ai", text: LANG_CONFIG[lang].welcome }]);
+  }, [lang]);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
+  }, [chat, load]);
+
+  // Cleanup on unmount
+  useEffect(() => () => {
+    if (recognitionRef.current) try { recognitionRef.current.abort(); } catch {}
+    if (silenceTimer.current) clearTimeout(silenceTimer.current);
+    window.speechSynthesis?.cancel();
+  }, []);
+
+  const speak = (text) => {
+    if (!window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = L.bcp;
+    utterance.rate = 0.85;
+    utterance.pitch = 1.05;
+    utterance.volume = 1;
+    // Pick best available voice for language
+    const voices = window.speechSynthesis.getVoices();
+    const match = voices.find(v => v.lang.startsWith(L.bcp.split("-")[0]));
+    if (match) utterance.voice = match;
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const sendMessage = async (msg) => {
+    const text = msg.trim();
+    if (!text) return;
+    const newUserMsg = { role:"user", text };
+    setChat(c => [...c, newUserMsg]);
+    setInp("");
+    setLoad(true);
+
+    // Build Groq message history (last 10 turns for context)
+    const systemPrompt = {
+      role: "system",
+      content:
+        `You are AgriSense, a friendly and knowledgeable AI farming assistant for Indian rural farmers. ` +
+        `ALWAYS respond ONLY in ${L.geminiLang} language. ` +
+        `Use very simple words that a farmer with basic education can understand. ` +
+        `Be warm, encouraging, and practical. Give specific actionable advice. ` +
+        `Keep every response under 80 words. ` +
+        `If asked about crops, soil, pests, weather, fertilizers, market prices, or irrigation — give clear helpful answers. ` +
+        `Always end with one short encouraging sentence.`,
+    };
+
+    // Convert chat history to Groq format (exclude typing indicators)
+    const history = chat.slice(-10).map(m => ({
+      role: m.role === "user" ? "user" : "assistant",
+      content: m.text,
+    }));
+
+    const groqMessages = [
+      systemPrompt,
+      ...history,
+      { role: "user", content: text },
+    ];
+
+    try {
+      const reply = await groqChat(groqMessages);
+      const finalReply = reply || (
+        lang === "en"
+          ? "I'm sorry, I couldn't connect right now. Please try again in a moment."
+          : lang === "hi"
+          ? "माफ करें, अभी जवाब नहीं मिला। कृपया फिर कोशिश करें।"
+          : lang === "te"
+          ? "క్షమించండి, ఇప్పుడు జవాబు రాలేదు. మళ్ళీ ప్రయత్నించండి."
+          : lang === "kn"
+          ? "ಕ್ಷಮಿಸಿ, ಈಗ ಉತ್ತರ ಸಿಗಲಿಲ್ಲ. ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ."
+          : lang === "ml"
+          ? "ക്ഷമിക്കൂ, ഇപ്പോൾ ഉത്തരം ലഭിച്ചില്ല. വീണ്ടും ശ്രമിക്കൂ."
+          : "மீண்டும் முயற்சிக்கவும்."
+      );
+      setChat(c => [...c, { role:"ai", text: finalReply }]);
+      speak(finalReply);
+    } catch (e) {
+      const errMsg = lang === "en"
+        ? "⚠️ Network error. Please check your connection and try again."
+        : "⚠️ இணைப்பு தவறு. மீண்டும் முயற்சிக்கவும்.";
+      setChat(c => [...c, { role:"ai", text: errMsg }]);
+    }
+    setLoad(false);
+  };
+
+  const startVoice = () => {
+    // Stop any ongoing speech
+    window.speechSynthesis?.cancel();
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setChat(c => [...c, { role:"ai", text: L.voiceNotSupported }]);
+      return;
+    }
+
+    // Stop existing recognition
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch {}
+      recognitionRef.current = null;
+    }
+
+    setVoiceStatus("starting");
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = L.bcp;
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setListening(true);
+      setVoiceStatus("listening");
+      // Auto-stop after 8 seconds of silence
+      silenceTimer.current = setTimeout(() => {
+        try { recognition.stop(); } catch {}
+      }, 8000);
+    };
+
+    recognition.onresult = (e) => {
+      if (silenceTimer.current) clearTimeout(silenceTimer.current);
+      const transcript = e.results[0][0].transcript;
+      setListening(false);
+      setVoiceStatus("idle");
+      if (transcript.trim()) sendMessage(transcript);
+    };
+
+    recognition.onerror = (e) => {
+      if (silenceTimer.current) clearTimeout(silenceTimer.current);
+      setListening(false);
+      setVoiceStatus("error");
+      setTimeout(() => setVoiceStatus("idle"), 2000);
+      if (e.error !== "aborted" && e.error !== "no-speech") {
+        setChat(c => [...c, { role:"ai", text: `⚠️ ${L.voiceError} (${e.error})` }]);
+      }
+    };
+
+    recognition.onend = () => {
+      if (silenceTimer.current) clearTimeout(silenceTimer.current);
+      setListening(false);
+      if (voiceStatus === "listening") setVoiceStatus("idle");
+    };
+
+    recognitionRef.current = recognition;
+
+    try {
+      recognition.start();
+    } catch (err) {
+      setVoiceStatus("error");
+      setListening(false);
+      setTimeout(() => setVoiceStatus("idle"), 2000);
+      setChat(c => [...c, { role:"ai", text: L.voiceNotSupported }]);
+    }
+  };
+
+  const stopVoice = () => {
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+      recognitionRef.current = null;
+    }
+    if (silenceTimer.current) clearTimeout(silenceTimer.current);
+    setListening(false);
+    setVoiceStatus("idle");
+  };
+
+  const orbColor = voiceStatus === "listening" ? "#c0392b"
+    : voiceStatus === "starting" ? "#f5a623"
+    : voiceStatus === "error" ? "#7b3f9e"
+    : "#1e7a3e";
+
+  const orbIcon = voiceStatus === "listening" ? "🔴"
+    : voiceStatus === "starting" ? "⏳"
+    : voiceStatus === "error" ? "⚠️"
+    : "🎙️";
+
+  const orbLabel = voiceStatus === "listening" ? L.listening
+    : voiceStatus === "starting" ? (lang === "en" ? "Starting..." : "தொடங்குகிறது...")
+    : voiceStatus === "error" ? L.voiceError
+    : L.tapSpeak;
+
+  return (
+    <div className="page">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+        <div className="section-title" style={{margin:0}}>🎙️ {lang==="en"?"Voice & Chat":"குரல் & Chat"}</div>
+        <button onClick={onChangeLang} style={{
+          background:"#e6f7ed",border:"2px solid #a8ddb8",borderRadius:30,
+          padding:"8px 16px",fontFamily:"'Nunito',sans-serif",
+          fontSize:13,fontWeight:800,color:"#1a6b3c",cursor:"pointer",
+          display:"flex",alignItems:"center",gap:6,
+        }}>
+          🌐 {L.changeLang}
+        </button>
+      </div>
+
+      {/* AI powered badge */}
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+        <div style={{
+          background:"linear-gradient(135deg,#1a1a2e,#16213e)",
+          border:"1.5px solid #0f3460",
+          borderRadius:30,padding:"5px 14px",
+          display:"flex",alignItems:"center",gap:6,
+        }}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:"#00ff88",boxShadow:"0 0 6px #00ff88",animation:"pulse 2s infinite"}}/>
+          <span style={{fontFamily:"'Nunito',sans-serif",fontSize:12,fontWeight:800,color:"#00ff88"}}>AI</span>
+          <span style={{fontFamily:"'Nunito',sans-serif",fontSize:11,fontWeight:600,color:"rgba(255,255,255,0.6)"}}>Claude · Multilingual Chat</span>
+        </div>
+        <div style={{fontSize:13,color:"#7a9a7e",fontWeight:600}}>
+          {LANG_CONFIG[lang].label} · {lang==="en"?"Speak or type":"பேசுங்கள் அல்லது தட்டச்சு"}
+        </div>
+      </div>
+
+      {/* CHAT AREA */}
+      <div className="card" style={{padding:0,overflow:"hidden"}}>
+        {/* Chat messages */}
+        <div ref={chatRef} style={{
+          display:"flex",flexDirection:"column",gap:10,
+          maxHeight:320,overflowY:"auto",
+          padding:"16px 16px 10px",
+          background:"#f9fbf9",
+        }}>
+          {chat.map((m,i) => (
+            <div key={i} className={m.role==="user"?"bubble-user":"bubble-ai"}>{m.text}</div>
+          ))}
+          {load && (
+            <div className="bubble-ai">
+              <div className="typing">
+                <div className="typing-dot"/><div className="typing-dot"/><div className="typing-dot"/>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Input bar */}
+        <div style={{padding:"10px 12px 14px",borderTop:"2px solid #d4e8d8",background:"#fff"}}>
+          <div style={{display:"flex",gap:8}}>
+            <input
+              className="search-input"
+              style={{flex:1,fontSize:15}}
+              placeholder={L.typeHere}
+              value={inp}
+              onChange={e=>setInp(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&!load&&sendMessage(inp)}
+            />
+            <button
+              onClick={()=>sendMessage(inp)}
+              disabled={load||!inp.trim()}
+              style={{
+                background:inp.trim()&&!load?"#1e7a3e":"#d4e8d8",
+                color:"#fff",border:"none",borderRadius:14,
+                padding:"0 20px",fontFamily:"'Nunito',sans-serif",
+                fontSize:20,fontWeight:900,cursor:inp.trim()&&!load?"pointer":"default",
+                transition:"background 0.15s",flexShrink:0,
+              }}
+            >➤</button>
+          </div>
+        </div>
+      </div>
+
+      {/* VOICE ORB */}
+      <div className="card">
+        <div className="voice-orb-wrap" style={{paddingTop:16,paddingBottom:12}}>
+          <div
+            onClick={listening ? stopVoice : startVoice}
+            style={{
+              width:110,height:110,borderRadius:"50%",
+              background:orbColor,
+              display:"flex",alignItems:"center",justifyContent:"center",
+              fontSize:46,cursor:"pointer",
+              boxShadow:`0 6px 24px ${orbColor}66`,
+              animation: voiceStatus==="listening" ? "orbpulse 1.2s infinite" : "none",
+              transition:"background 0.3s,box-shadow 0.3s",
+            }}
+          >
+            {orbIcon}
+          </div>
+          <div style={{
+            fontFamily:"'Nunito',sans-serif",fontSize:16,fontWeight:800,
+            color: voiceStatus==="error"?"#c0392b":voiceStatus==="listening"?"#c0392b":"#4a6b4f",
+            marginTop:12,textAlign:"center",maxWidth:220,
+          }}>
+            {orbLabel}
+          </div>
+          {listening && (
+            <div style={{
+              background:"#fdf0ee",border:"2px solid #e74c3c",borderRadius:30,
+              padding:"6px 18px",marginTop:8,
+              fontFamily:"'Nunito',sans-serif",fontSize:13,fontWeight:800,color:"#c0392b",
+            }}>
+              {lang==="en"?"Tap again to stop":"மீண்டும் தட்டினால் நிறுத்தும்"}
+            </div>
+          )}
+        </div>
+
+        {/* Sound wave animation when listening */}
+        {listening && (
+          <div style={{display:"flex",justifyContent:"center",gap:4,marginBottom:12}}>
+            {[1,2,3,4,5,6,7].map(i=>(
+              <div key={i} style={{
+                width:4,borderRadius:4,background:"#c0392b",
+                animation:`wave 0.8s ${i*0.1}s infinite ease-in-out`,
+              }}/>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* QUICK QUESTIONS */}
+      <div className="card">
+        <div className="section-title" style={{fontSize:15,margin:"0 0 12px"}}>⚡ {lang==="en"?"Quick Questions":"விரைவு கேள்விகள்"}</div>
+        <div style={{display:"flex",flexWrap:"wrap"}}>
+          {L.quickQ.map(q => (
+            <div key={q} className="quick-q" onClick={()=>!load&&sendMessage(q)}>{q}</div>
+          ))}
+        </div>
+      </div>
+
+      {/* Wave animation keyframes */}
+      <style>{`
+        @keyframes wave {
+          0%,100%{height:6px}
+          50%{height:28px}
+        }
+      `}</style>
+    </div>
+  );
+}
+
+/* ═══ APP SHELL ═══ */
+const TABS = [
+  { id:"home",   icon:"🏠", en:"Home",   ta:"முகப்பு" },
+  { id:"soil",   icon:"🪨", en:"Soil",   ta:"மண்" },
+  { id:"crops",  icon:"🌾", en:"Crops",  ta:"பயிர்" },
+  { id:"scan",   icon:"📷", en:"Scan",   ta:"படம்" },
+  { id:"market", icon:"📊", en:"Market", ta:"சந்தை" },
+  { id:"voice",  icon:"🎙️", en:"Voice",  ta:"குரல்" },
+];
+
+export default function App() {
+  const [tab, setTab] = useState("home");
+  const [appLang, setAppLang] = useState("ta");
+  const [showLangModal, setShowLangModal] = useState(false);
+  const [wx, setWx] = useState(null);
+  const [wxLoad, setWxLoad] = useState(true);
+
+  const L = LANG_CONFIG[appLang];
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`https://api.weatherapi.com/v1/forecast.json?key=${KEYS.weather}&q=Chennai,India&days=5&aqi=no`);
+        if (r.ok) setWx(await r.json());
+      } catch {}
+      setWxLoad(false);
+    })();
+  }, []);
+
+  const temp = wx ? `${Math.round(wx.current.temp_c)}°C` : null;
+
+  const pages = {
+    home:   <Dashboard wx={wx} wxLoading={wxLoad} lang={appLang} />,
+    soil:   <Soil />,
+    crops:  <CropsPage />,
+    scan:   <Scan />,
+    market: <Market lang={appLang} />,
+    voice:  <Voice lang={appLang} onChangeLang={()=>setShowLangModal(true)} />,
+  };
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <style>{`
+        @keyframes orbpulse {
+          0%,100%{box-shadow:0 6px 24px rgba(192,57,43,0.4)}
+          50%{box-shadow:0 6px 48px rgba(192,57,43,0.7)}
+        }
+      `}</style>
+      <div className="app">
+
+        {/* LANGUAGE MODAL */}
+        {showLangModal && (
+          <LangModal
+            currentLang={appLang}
+            onSelect={code => { setAppLang(code); setShowLangModal(false); }}
+            onClose={() => setShowLangModal(false)}
+          />
+        )}
+
+        {/* TOP BAR */}
+        <div className="topbar">
+          <div className="topbar-brand">
+            <div className="topbar-icon">🌾</div>
+            <div>
+              <div className="topbar-name">AgriSense</div>
+              <div className="topbar-tagline">{L.farmAssistant}</div>
+            </div>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            {/* LANGUAGE SWITCHER */}
+            <button onClick={()=>setShowLangModal(true)} style={{
+              background:"rgba(255,255,255,0.15)",
+              border:"1.5px solid rgba(255,255,255,0.3)",
+              borderRadius:30,padding:"6px 12px",
+              display:"flex",alignItems:"center",gap:5,
+              fontFamily:"'Nunito',sans-serif",fontSize:13,fontWeight:800,
+              color:"#fff",cursor:"pointer",
+            }}>
+              🌐 {L.label}
+            </button>
+            {temp && <div className="topbar-weather">🌡️ {temp}</div>}
+          </div>
+        </div>
+
+        {/* PAGE CONTENT */}
+        <div key={`${tab}-${appLang}`}>{pages[tab]}</div>
+
+        {/* BOTTOM NAV */}
+        <nav className="bottom-nav">
+          {TABS.map(t => {
+            const label = appLang === "en" ? t.en : t.ta;
+            return (
+              <button key={t.id} className={`nav-btn${tab===t.id?" active":""}`} onClick={()=>setTab(t.id)}>
+                <span className="nav-icon">{t.icon}</span>
+                <span>{label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      </div>
+    </>
+  );
+}
